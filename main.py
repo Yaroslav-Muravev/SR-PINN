@@ -7,9 +7,10 @@ import scipy.io as sio
 from scipy.spatial import cKDTree
 from torch.utils.data import Dataset, DataLoader
 import os
-from typing import Optional, Tuple, List, Dict
+import glob
 import re
 import h5py
+from typing import Optional, Tuple, List, Dict
 
 path_to_files = "./files/"
 
@@ -17,8 +18,6 @@ path_to_files = "./files/"
 def parse_complex(s: str) -> complex:
     """Парсит строку вида '-7.83e-11-4.15e-12i' в комплексное число."""
     s = s.strip().replace(' ', '')
-    # Используем регулярное выражение для извлечения действительной и мнимой частей
-    # Пример: "-7.83690106986e-11-4.15753320203e-12i"
     pattern = r'^([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)?([-+]\d*\.?\d+(?:[eE][-+]?\d+)?)i$'
     m = re.match(pattern, s)
     if m:
@@ -26,31 +25,19 @@ def parse_complex(s: str) -> complex:
         im_part = float(m.group(2))
         return complex(re_part, im_part)
     else:
-        # Попробуем просто complex()
         try:
             return complex(s)
         except:
             return complex(np.nan, np.nan)
 
 def load_complex_from_h5(f, key: str) -> np.ndarray:
-    """
-    Загружает датасет из h5py и преобразует в комплексный массив,
-    если он хранится в структурированном виде (поля 'real' и 'imag').
-    """
     data = f[key][:]
     if data.dtype.fields:
-        # Это структурированный массив с полями real и imag
         return data['real'] + 1j * data['imag']
     else:
-        # Уже комплексный или вещественный (вещественный тоже пойдёт, но нам нужен комплекс)
         return data
 
 def normalize_global_per_channel(data: np.ndarray, eps: float = 1e-8) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Глобальная нормализация по каждому каналу независимо.
-    data: [N, C]
-    возвращает: (data_norm, mean[C], std[C])
-    """
     mean = data.mean(axis=0)
     std = data.std(axis=0)
     std[std < eps] = 1.0
@@ -64,32 +51,39 @@ def build_kdtree(coords: np.ndarray) -> cKDTree:
 
 def find_coarse_patch(coarse_tree: cKDTree,
                       coarse_coords: np.ndarray,
-                      coarse_fields: np.ndarray,   # [N_coarse, 8] (Re/Im для 4 полей)
+                      coarse_fields: np.ndarray,
                       query_point: np.ndarray,
                       n_neighbors: int = 8) -> np.ndarray:
-    """
-    Возвращает вектор: [значения полей в соседях (8*8 = 64), относительные координаты (8*3 = 24)] -> всего 88.
-    """
     dists, idxs = coarse_tree.query(query_point, k=n_neighbors)
-    neighbor_coords = coarse_coords[idxs]               # [n_neighbors, 3]
-    neighbor_fields = coarse_fields[idxs]                # [n_neighbors, 8]
+    neighbor_coords = coarse_coords[idxs]
+    neighbor_fields = coarse_fields[idxs]
     scale = np.mean(dists) + 1e-8
-    rel_coords = (neighbor_coords - query_point) / scale   # [n_neighbors, 3]
-    # Конкатенация
+    rel_coords = (neighbor_coords - query_point) / scale
     patch = np.concatenate([neighbor_fields.ravel(), rel_coords.ravel()])
     return patch
 
+# ---------------------- Загрузка всех CSV ----------------------
+def load_all_csv(data_dir: str, pattern: str) -> pd.DataFrame:
+    """
+    Загружает все CSV-файлы, начинающиеся с pattern, и объединяет в один DataFrame.
+    pattern: например 'results_coarse' или 'results_fine'
+    """
+    csv_files = glob.glob(os.path.join(data_dir, f"{pattern}*.csv"))
+    if not csv_files:
+        return pd.DataFrame()
+    df_list = []
+    for f in csv_files:
+        df = pd.read_csv(f)
+        df_list.append(df)
+    return pd.concat(df_list, ignore_index=True)
+
 # ---------------------- Датасет для fine/coarse данных ----------------------
 class CylinderStressDataset(Dataset):
-    """
-    Загружает .mat файлы, обрабатывает комплексные поля (4 поля -> 8 компонент).
-    Для каждого ID хранит маски торцов (bottom/top) на основе z-координат.
-    """
     def __init__(self,
                  data_dir: str,
-                 csv_path: str,
+                 csv_df: pd.DataFrame,   # объединённый DataFrame для нужного mesh_type
                  ids: List[int],
-                 mesh_type: str,          # 'fine' или 'coarse' (для каких данных строить выборку)
+                 mesh_type: str,
                  n_neighbors: int = 8,
                  normalize: bool = True):
         self.data_dir = data_dir
@@ -97,21 +91,19 @@ class CylinderStressDataset(Dataset):
         self.normalize = normalize
         self.mesh_type = mesh_type
 
-        # Загружаем CSV с параметрами и комплексным напряжением
-        self.df = pd.read_csv(csv_path)
-        self.df = self.df[self.df['id'].isin(ids)].reset_index(drop=True)
-        # Парсим voltage в комплексные числа
+        # Оставляем только строки с нужными id
+        self.df = csv_df[csv_df['id'].isin(ids)].reset_index(drop=True)
+        # Парсим voltage
         self.df['voltage_complex'] = self.df['voltage'].apply(parse_complex)
 
-        # Списки данных для каждого ID
-        self.coords_list = []           # координаты узлов (N_i, 3)
-        self.fields_list = []            # поля (N_i, 8) – порядок: Re(ux), Im(ux), Re(uy), Im(uy), Re(uz), Im(uz), Re(phi), Im(phi)
-        self.shape_params = []           # параметры формы (r_um, h_um) для каждого id
-        self.id_to_index = {}            # id -> индекс в списке
-        self.z_min_list = []              # минимальное Z для каждого ID
-        self.z_max_list = []              # максимальное Z
-        self.bottom_mask_list = []        # булева маска для нижнего торца (длина N_i)
-        self.top_mask_list = []           # булева маска для верхнего торца
+        self.coords_list = []
+        self.fields_list = []
+        self.shape_params = []
+        self.id_to_index = {}
+        self.z_min_list = []
+        self.z_max_list = []
+        self.bottom_mask_list = []
+        self.top_mask_list = []
 
         self.total_points = 0
         self.cumulative_sizes = [0]
@@ -125,15 +117,6 @@ class CylinderStressDataset(Dataset):
                 print(f"Warning: file {fname} not found, skipping id {id_}")
                 continue
 
-            # mat = sio.loadmat(fname)
-            # X = mat['X']
-            # Y = mat['Y']
-            # Z = mat['Z']
-            # ux = mat['ux']   # комплексные
-            # uy = mat['uy']
-            # uz = mat['uz']
-            # phi = mat['phi']
-
             with h5py.File(fname, 'r') as f:
                 X = f['X'][:]
                 Y = f['Y'][:]
@@ -143,29 +126,25 @@ class CylinderStressDataset(Dataset):
                 uz = load_complex_from_h5(f, 'uz')
                 phi = load_complex_from_h5(f, 'phi')
 
-            # Преобразуем в плоские массивы
-            coords = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)   # [N,3]
-            # Разделяем на действительные и мнимые части
+            coords = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
             fields = np.stack([
                 ux.real.ravel(), ux.imag.ravel(),
                 uy.real.ravel(), uy.imag.ravel(),
                 uz.real.ravel(), uz.imag.ravel(),
                 phi.real.ravel(), phi.imag.ravel()
-            ], axis=1)   # [N,8]
+            ], axis=1)
 
             self.coords_list.append(coords)
             self.fields_list.append(fields)
             self.shape_params.append([r_um, h_um])
             self.id_to_index[id_] = len(self.coords_list) - 1
 
-            # Определяем торцы по Z
             z_vals = Z.ravel()
             z_min = z_vals.min()
             z_max = z_vals.max()
             self.z_min_list.append(z_min)
             self.z_max_list.append(z_max)
-            # Маски с допуском
-            eps_z = 1e-6 * (z_max - z_min)  # относительный допуск
+            eps_z = 1e-6 * (z_max - z_min)
             bottom_mask = np.abs(z_vals - z_min) < eps_z
             top_mask = np.abs(z_vals - z_max) < eps_z
             self.bottom_mask_list.append(bottom_mask)
@@ -176,30 +155,44 @@ class CylinderStressDataset(Dataset):
 
         self.n_ids = len(self.coords_list)
 
-        # Статистики для нормализации (по 8 каналам полей, 3 координатам, 2 параметрам формы)
-        if normalize:
+        if normalize and self.total_points > 0:
             all_coords = np.vstack(self.coords_list)
             self.coords_mean = all_coords.mean(axis=0)
             self.coords_std = all_coords.std(axis=0)
-            self.coords_std[self.coords_std < 1e-8] = 1.0 # Заглушка
+            self.coords_std[self.coords_std < 1e-8] = 1.0
 
             all_shape = np.array(self.shape_params)
             self.shape_mean = all_shape.mean(axis=0)
             self.shape_std = all_shape.std(axis=0)
-            self.shape_std[self.shape_std < 1e-8] = 1.0 # Заглушка
+            self.shape_std[self.shape_std < 1e-8] = 1.0
 
             all_fields = np.vstack(self.fields_list)
-            self.fields_mean, self.fields_std = all_fields.mean(axis=0), all_fields.std(axis=0)
-            # Избегаем нулевого std
+            self.fields_mean = all_fields.mean(axis=0)
+            self.fields_std = all_fields.std(axis=0)
             self.fields_std[self.fields_std < 1e-8] = 1.0
 
-        # Для coarse-патчей (будут установлены позже)
+            print(f"\n=== Dataset {mesh_type} stats ===")
+            print(f"coords_mean = {self.coords_mean}")
+            print(f"coords_std  = {self.coords_std}")
+            print(f"shape_mean  = {self.shape_mean}")
+            print(f"shape_std   = {self.shape_std}")
+            print(f"fields_mean (phi real) = {self.fields_mean[6]:.3e}")
+            print(f"fields_std  (phi real) = {self.fields_std[6]:.3e}")
+            print("==============================\n")
+        else:
+            # fallback для пустого датасета
+            self.coords_mean = np.zeros(3)
+            self.coords_std = np.ones(3)
+            self.shape_mean = np.zeros(2)
+            self.shape_std = np.ones(2)
+            self.fields_mean = np.zeros(8)
+            self.fields_std = np.ones(8)
+
         self.coarse_trees = None
         self.coarse_coords = None
         self.coarse_fields = None
 
     def set_coarse_data(self, coarse_coords_list, coarse_fields_list, coarse_ids):
-        """Передаёт данные coarse сетки для построения k-d деревьев."""
         self.coarse_trees = {}
         self.coarse_coords = {}
         self.coarse_fields = {}
@@ -210,7 +203,6 @@ class CylinderStressDataset(Dataset):
                 self.coarse_fields[id_] = coarse_fields_list[idx]
 
     def get_id_slice(self, id_: int) -> slice:
-        """Возвращает slice для всех точек данного id в общем датасете."""
         idx = self.id_to_index.get(id_)
         if idx is None:
             return slice(0,0)
@@ -222,32 +214,30 @@ class CylinderStressDataset(Dataset):
         return self.total_points
 
     def __getitem__(self, idx):
-        # Определяем, какому id принадлежит точка
+        if self.total_points == 0:
+            # пустой датасет
+            return {}
         id_idx = np.searchsorted(self.cumulative_sizes, idx, side='right') - 1
         local_idx = idx - self.cumulative_sizes[id_idx]
 
         id_ = int(self.df.iloc[id_idx]['id'])
-        coords = self.coords_list[id_idx][local_idx]            # [3]
-        fields = self.fields_list[id_idx][local_idx]            # [8]
-        shape = np.array(self.shape_params[id_idx])             # [2]
+        coords = self.coords_list[id_idx][local_idx]
+        fields = self.fields_list[id_idx][local_idx]
+        shape = np.array(self.shape_params[id_idx])
 
-        # Получаем coarse-патч
         if self.coarse_trees is not None and id_ in self.coarse_trees:
             tree = self.coarse_trees[id_]
             coarse_coords = self.coarse_coords[id_]
-            coarse_fields = self.coarse_fields[id_]             # [N_coarse,8]
+            coarse_fields = self.coarse_fields[id_]
             patch = find_coarse_patch(tree, coarse_coords, coarse_fields,
                                       coords, self.n_neighbors)
         else:
-            # fallback (например, для валидации без coarse)
             patch = np.zeros(self.n_neighbors * (8 + 3))
 
-        # Нормализация
         if self.normalize:
             coords = (coords - self.coords_mean) / self.coords_std
             shape = (shape - self.shape_mean) / self.shape_std
             fields = (fields - self.fields_mean) / self.fields_std
-            # Патч: отделяем поля (первые 8*8 = 64) и rel_coords (последние 24)
             n_fields_flat = self.n_neighbors * 8
             patch_fields = patch[:n_fields_flat].reshape(self.n_neighbors, 8)
             patch_rel = patch[n_fields_flat:].reshape(self.n_neighbors, 3)
@@ -264,7 +254,6 @@ class CylinderStressDataset(Dataset):
 
 # ---------------------- Датасет для коллокационных точек ----------------------
 class CollocationDataset(Dataset):
-    """Генерирует случайные точки внутри цилиндра, с coarse-патчами."""
     def __init__(self,
                  ids: List[int],
                  shape_params: Dict[int, Tuple[float, float]],
@@ -277,7 +266,7 @@ class CollocationDataset(Dataset):
                  fields_stats: Optional[Tuple[np.ndarray, np.ndarray]] = None):
         self.ids = ids
         self.shape_params = shape_params
-        self.coarse_data = coarse_data   # id -> (coords, fields, tree)
+        self.coarse_data = coarse_data
         self.n_points_per_id = n_points_per_id
         self.n_neighbors = n_neighbors
         self.normalize = normalize
@@ -300,7 +289,6 @@ class CollocationDataset(Dataset):
         H = h_um * 1e-6
         z0 = -H/2
 
-        # Случайная точка внутри цилиндра (равномерно по объёму)
         u = np.random.random()
         v = np.random.random()
         w = np.random.random()
@@ -311,7 +299,6 @@ class CollocationDataset(Dataset):
         y = r * np.sin(theta)
         point = np.array([x, y, z])
 
-        # Coarse-патч
         tree, coarse_coords, coarse_fields = self.coarse_data[id_]
         patch = find_coarse_patch(tree, coarse_coords, coarse_fields, point, self.n_neighbors)
 
@@ -333,7 +320,7 @@ class CollocationDataset(Dataset):
             'id': id_
         }
 
-# ---------------------- Модель SR-PINN (адаптирована под 8 выходов) ----------------------
+# ---------------------- Модель SR-PINN ----------------------
 class FourierFeatureEmbedding(nn.Module):
     def __init__(self, input_dim: int, mapping_size: int = 128, scale: float = 10.0):
         super().__init__()
@@ -368,7 +355,7 @@ class SRPINN(nn.Module):
                  n_spatial: int = 3,
                  n_shape_params: int = 2,
                  n_coarse_nodes: int = 8,
-                 n_field_vars: int = 8,        # теперь 8 (Re/Im для 4 полей)
+                 n_field_vars: int = 8,
                  hidden_dim: int = 256,
                  n_blocks: int = 8,
                  fourier_mapping_size: int = 128,
@@ -382,7 +369,7 @@ class SRPINN(nn.Module):
 
         self.shape_embed = nn.Linear(n_shape_params, hidden_dim)
 
-        coarse_input_dim = n_coarse_nodes * (n_field_vars + 3)  # 8*(8+3)=88
+        coarse_input_dim = n_coarse_nodes * (n_field_vars + 3)
         self.coarse_embed = nn.Linear(coarse_input_dim, hidden_dim)
 
         self.input_proj = nn.Linear(fourier_dim + hidden_dim + hidden_dim, hidden_dim)
@@ -411,50 +398,39 @@ class SRPINN(nn.Module):
         out = self.output_proj(x)
         return out
 
-# ---------------------- Функция потерь (упрощённая PDE, нужно заменить на реальную) ----------------------
+# ---------------------- Функция потерь (только data loss) ----------------------
 class StressPINNLoss(nn.Module):
-    def __init__(self,
-                 lambda_data: float = 1.0,
-                 lambda_pde: float = 0.01):
+    def __init__(self, lambda_data: float = 1.0):
         super().__init__()
         self.lambda_data = lambda_data
-        self.lambda_pde = lambda_pde
         self.mse = nn.MSELoss()
 
     def forward(self, model, batch, batch_pde=None):
         loss_data = torch.tensor(0.0, device=next(model.parameters()).device)
-        loss_pde = torch.tensor(0.0, device=loss_data.device)
-
-        # Supervised loss
         if 'target' in batch:
             pred = model(batch['coords'], batch['shape_params'], batch['coarse_patch'])
             loss_data = self.mse(pred, batch['target'])
-
-        # PDE loss на коллокационных точках (упрощённый, требует замены)
-        if batch_pde is not None:
-            coords_pde = batch_pde['coords'].detach().clone().requires_grad_(True)
-            pred_pde = model(coords_pde, batch_pde['shape_params'], batch_pde['coarse_patch'])
-            # Для демонстрации: сумма квадратов градиентов (не физично, просто placeholder)
-            grad = torch.autograd.grad(pred_pde.sum(), coords_pde,
-                                       create_graph=True, retain_graph=True)[0]  # [N,3]
-            loss_pde = (grad**2).mean()
-
-        total_loss = self.lambda_data * loss_data + self.lambda_pde * loss_pde
-        return total_loss, {'loss_data': loss_data.item(), 'loss_pde': loss_pde.item(), 'total_loss': total_loss.item()}
+        total_loss = self.lambda_data * loss_data
+        return total_loss, {'loss_data': loss_data.item(), 'total_loss': total_loss.item()}
 
 # ---------------------- Подготовка данных и обучение ----------------------
 def prepare_datasets(data_dir: str,
-                     csv_coarse: str,
-                     csv_fine: str,
-                     ids_train: List[int],
-                     ids_val: List[int],
+                     coarse_ids: List[int],
+                     fine_ids: List[int],
                      n_neighbors: int = 8):
     """
-    Загружает coarse и fine данные, строит k-d деревья.
-    Возвращает train_dataset, val_dataset, colloc_dataset, stats.
+    Загружает все coarse и fine данные, строит k-d деревья.
+    coarse_ids: список всех ID, для которых есть coarse .mat (можно передать все 1..100)
+    fine_ids: список ID, для которых есть fine .mat (извлечём из наличия файлов)
     """
-    # 1. Загружаем coarse данные для всех id (понадобятся для патчей)
-    coarse_ids = ids_train + ids_val
+    # 1. Загружаем все CSV
+    coarse_df = load_all_csv(data_dir, 'results_coarse')
+    fine_df = load_all_csv(data_dir, 'results_fine')
+
+    if coarse_df.empty or fine_df.empty:
+        raise ValueError("Не найдены CSV файлы для coarse или fine")
+
+    # 2. Загружаем coarse данные для всех coarse_ids (или для тех, у кого есть файлы)
     coarse_coords_list = []
     coarse_fields_list = []
     coarse_shape_dict = {}
@@ -464,11 +440,6 @@ def prepare_datasets(data_dir: str,
         fname = os.path.join(data_dir, f'pinndata_quick_id_{id_:04d}_coarse.mat')
         if not os.path.exists(fname):
             continue
-        # with h5py.File(fname, 'r') as f:
-        #   #mat = f.getwith h5py.File('filename.mat', 'r') as f:(fname)
-        #   X, Y, Z = np.array(f.get('X')), np.array(f.get('Y')), np.array(f.get('Z'))
-        #   ux, uy, uz, phi = np.array(f.get('ux')), np.array(f.get('uy')), np.array(f.get('uz')), np.array(f.get('phi'))
-
         with h5py.File(fname, 'r') as f:
             X = f['X'][:]
             Y = f['Y'][:]
@@ -477,7 +448,6 @@ def prepare_datasets(data_dir: str,
             uy = load_complex_from_h5(f, 'uy')
             uz = load_complex_from_h5(f, 'uz')
             phi = load_complex_from_h5(f, 'phi')
-
         coords = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
         fields = np.stack([
             ux.real.ravel(), ux.imag.ravel(),
@@ -489,51 +459,64 @@ def prepare_datasets(data_dir: str,
         coarse_fields_list.append(fields)
         coarse_id_list.append(id_)
         # Параметры из coarse CSV
-        dfc = pd.read_csv(csv_coarse)
-        dfc = dfc[dfc['id'] == id_]
-        if len(dfc) > 0:
-            row = dfc.iloc[0]
-            coarse_shape_dict[id_] = (row['r_um'], row['h_um'])
+        row = coarse_df[coarse_df['id'] == id_]
+        if not row.empty:
+            coarse_shape_dict[id_] = (row.iloc[0]['r_um'], row.iloc[0]['h_um'])
 
-    # 2. Создаём датасеты для fine данных
+    # 3. Fine датасеты: используем только те fine_ids, для которых есть fine .mat
+    valid_fine_ids = []
+    for id_ in fine_ids:
+        fname = os.path.join(data_dir, f'pinndata_quick_id_{id_:04d}_fine.mat')
+        if os.path.exists(fname):
+            valid_fine_ids.append(id_)
+        else:
+            print(f"Warning: fine file for id {id_} not found, skipping")
+
+    train_ids = valid_fine_ids[:]   # можно разделить позже
+    val_ids = []   # если хотим валидацию на отдельном ID, пока оставим пустым
+
+    if len(train_ids) == 0:
+        raise ValueError("Нет доступных fine файлов для обучения")
+
+    # 4. Создаём датасеты
     train_dataset = CylinderStressDataset(
         data_dir=data_dir,
-        csv_path=csv_fine,
-        ids=ids_train,
+        csv_df=fine_df,
+        ids=train_ids,
         mesh_type='fine',
         n_neighbors=n_neighbors,
         normalize=True
     )
     val_dataset = CylinderStressDataset(
         data_dir=data_dir,
-        csv_path=csv_fine,
-        ids=ids_val,
+        csv_df=fine_df,
+        ids=val_ids if val_ids else [train_ids[0]],   # если нет валидационных, используем первый train для валидации
         mesh_type='fine',
         n_neighbors=n_neighbors,
         normalize=True
     )
 
-    # 3. Передаём coarse данные в датасеты
+    # 5. Передаём coarse данные в датасеты
     coarse_for_train = {id_: (coarse_coords_list[i], coarse_fields_list[i], build_kdtree(coarse_coords_list[i]))
-                        for i, id_ in enumerate(coarse_id_list) if id_ in ids_train}
+                        for i, id_ in enumerate(coarse_id_list) if id_ in train_ids}
     coarse_for_val = {id_: (coarse_coords_list[i], coarse_fields_list[i], build_kdtree(coarse_coords_list[i]))
-                      for i, id_ in enumerate(coarse_id_list) if id_ in ids_val}
+                      for i, id_ in enumerate(coarse_id_list) if id_ in val_ids}
 
     train_dataset.set_coarse_data(
-        [coarse_for_train[id_][0] for id_ in ids_train if id_ in coarse_for_train],
-        [coarse_for_train[id_][1] for id_ in ids_train if id_ in coarse_for_train],
-        [id_ for id_ in ids_train if id_ in coarse_for_train]
+        [coarse_for_train[id_][0] for id_ in train_ids if id_ in coarse_for_train],
+        [coarse_for_train[id_][1] for id_ in train_ids if id_ in coarse_for_train],
+        [id_ for id_ in train_ids if id_ in coarse_for_train]
     )
     val_dataset.set_coarse_data(
-        [coarse_for_val[id_][0] for id_ in ids_val if id_ in coarse_for_val],
-        [coarse_for_val[id_][1] for id_ in ids_val if id_ in coarse_for_val],
-        [id_ for id_ in ids_val if id_ in coarse_for_val]
+        [coarse_for_val[id_][0] for id_ in val_ids if id_ in coarse_for_val],
+        [coarse_for_val[id_][1] for id_ in val_ids if id_ in coarse_for_val],
+        [id_ for id_ in val_ids if id_ in coarse_for_val]
     )
 
-    # 4. Коллокационные точки (только для train id)
-    colloc_ids = ids_train
-    coarse_data_colloc = {id_: (coarse_for_train[id_][2], coarse_for_train[id_][0], coarse_for_train[id_][1]) # tree coords fields
-                          for id_ in colloc_ids if id_ in coarse_for_train}
+    # 6. Коллокационные точки (только для train ids)
+    colloc_ids = [id_ for id_ in train_ids if id_ in coarse_for_train]
+    coarse_data_colloc = {id_: (coarse_for_train[id_][2], coarse_for_train[id_][0], coarse_for_train[id_][1])
+                          for id_ in colloc_ids}
     shape_params_colloc = {id_: coarse_shape_dict[id_] for id_ in colloc_ids if id_ in coarse_shape_dict}
 
     colloc_dataset = CollocationDataset(
@@ -558,25 +541,16 @@ def prepare_datasets(data_dir: str,
     }
     return train_dataset, val_dataset, colloc_dataset, stats
 
-# ---------------------- Функция вычисления ошибки напряжения на валидации ----------------------
-def compute_voltage_error(model, val_dataset, device, batch_size=256):
-    """
-    Вычисляет относительную ошибку напряжения (комплексного) для каждого ID в валидационном датасете.
-    Возвращает среднюю относительную ошибку по модулю.
-    """
+# ---------------------- Функция вычисления ошибки напряжения ----------------------
+def compute_voltage_error(model, val_dataset, device, verbose=False):
     model.eval()
-    # Собираем все ID, присутствующие в валидации
-    ids_val = val_dataset.df['id'].values
+    ids_val = val_dataset.df['id'].values if val_dataset.df is not None else []
     errors = []
     with torch.no_grad():
         for id_ in ids_val:
-            # Получаем индексы точек для этого ID
             slc = val_dataset.get_id_slice(id_)
             if slc.stop - slc.start == 0:
                 continue
-            # Извлекаем данные для всех точек этого ID
-            # Можно сделать прямой проход по подмассиву
-            # Соберём батч вручную
             indices = list(range(slc.start, slc.stop))
             batch_coords = []
             batch_shape = []
@@ -586,47 +560,51 @@ def compute_voltage_error(model, val_dataset, device, batch_size=256):
                 batch_coords.append(item['coords'].unsqueeze(0))
                 batch_shape.append(item['shape_params'].unsqueeze(0))
                 batch_patch.append(item['coarse_patch'].unsqueeze(0))
+            if not batch_coords:
+                continue
             coords = torch.cat(batch_coords, dim=0).to(device)
             shape = torch.cat(batch_shape, dim=0).to(device)
             patch = torch.cat(batch_patch, dim=0).to(device)
 
-            pred_fields = model(coords, shape, patch).cpu().numpy()  # [N,8]
-
-            # Восстанавливаем исходный масштаб полей (денормализуем)
+            pred_fields = model(coords, shape, patch).cpu().numpy()
             fields_mean = val_dataset.fields_mean
             fields_std = val_dataset.fields_std
             pred_fields_denorm = pred_fields * fields_std + fields_mean
 
-            # Извлекаем phi (Re) – канал 6 (индекс 6)
             phi_re = pred_fields_denorm[:, 6]
 
-            # Получаем маски торцов для этого ID
             id_idx = val_dataset.id_to_index[id_]
             bottom_mask = val_dataset.bottom_mask_list[id_idx]
             top_mask = val_dataset.top_mask_list[id_idx]
 
             if not np.any(bottom_mask) or not np.any(top_mask):
+                if verbose:
+                    print(f"ID {id_}: bottom_mask sum = {bottom_mask.sum()}, top_mask sum = {top_mask.sum()} -> skipping")
                 continue
 
             phi_bottom = phi_re[bottom_mask].mean()
             phi_top = phi_re[top_mask].mean()
-            V_pred = phi_top - phi_bottom  # комплексное? У нас только действительная часть
+            V_pred = phi_top - phi_bottom
 
-            # Сравниваем с CSV значением (комплексное)
             row = val_dataset.df[val_dataset.df['id'] == id_].iloc[0]
             V_true = row['voltage_complex']
-            # Берём действительную часть для сравнения (если нужно комплексное, надо предсказывать и мнимую часть phi)
-            # Пока только действительная
+
             error = abs(V_pred - V_true.real) / (abs(V_true.real) + 1e-8)
             errors.append(error)
 
+            if verbose and id_ == ids_val[0]:
+                print(f"ID {id_}: bottom_mask sum={bottom_mask.sum()}, top_mask sum={top_mask.sum()}")
+                print(f"  phi_bottom mean = {phi_bottom:.3e}, phi_top mean = {phi_top:.3e}")
+                print(f"  V_pred = {V_pred:.3e}, V_true.real = {V_true.real:.3e}")
+                print(f"  relative error = {error:.4f}")
+
     return np.mean(errors) if errors else float('inf')
 
-# ---------------------- Основной цикл обучения с валидацией напряжения ----------------------
+# ---------------------- Основной цикл обучения ----------------------
 def train_srpinn(model, train_loader, val_dataset, colloc_loader, n_epochs, device, lr=1e-3):
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
-    criterion = StressPINNLoss(lambda_data=1.0, lambda_pde=0.01)
+    criterion = StressPINNLoss(lambda_data=1.0)
 
     best_val_loss = float('inf')
     best_voltage_error = float('inf')
@@ -635,15 +613,14 @@ def train_srpinn(model, train_loader, val_dataset, colloc_loader, n_epochs, devi
         model.train()
         train_losses = []
 
-        # Итерация по supervised батчам
         for batch in train_loader:
+            # Получаем батч коллокационных точек (даже если не используем, для совместимости)
             try:
                 batch_pde = next(iter(colloc_loader))
             except StopIteration:
                 colloc_iter = iter(colloc_loader)
                 batch_pde = next(colloc_iter)
 
-            # Перенос на device
             for k in ['coords', 'shape_params', 'coarse_patch', 'target']:
                 if k in batch:
                     batch[k] = batch[k].to(device)
@@ -661,13 +638,10 @@ def train_srpinn(model, train_loader, val_dataset, colloc_loader, n_epochs, devi
 
         scheduler.step()
 
-        # Валидация каждые 10 эпох
         if epoch % 10 == 0:
-            # Вычисляем supervised loss на валидации (по батчам)
             model.eval()
             val_losses = []
             with torch.no_grad():
-                # Создаём DataLoader для валидации (без shuffle)
                 val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False)
                 for batch in val_loader:
                     for k in ['coords', 'shape_params', 'coarse_patch', 'target']:
@@ -679,13 +653,11 @@ def train_srpinn(model, train_loader, val_dataset, colloc_loader, n_epochs, devi
             avg_train = {k: np.mean([d[k] for d in train_losses]) for k in train_losses[0]}
             avg_val_loss = np.mean([d['total_loss'] for d in val_losses])
 
-            # Вычисляем ошибку напряжения
-            voltage_error = compute_voltage_error(model, val_dataset, device)
+            voltage_error = compute_voltage_error(model, val_dataset, device, verbose=True)
 
             print(f"Epoch {epoch}: train_loss={avg_train['total_loss']:.6f}, "
                   f"val_loss={avg_val_loss:.6f}, voltage_rel_error={voltage_error:.4f}")
 
-            # Сохраняем лучшую модель по комбинации (можно по voltage_error)
             if voltage_error < best_voltage_error:
                 best_voltage_error = voltage_error
                 torch.save(model.state_dict(), 'best_srpinn_model_voltage.pth')
@@ -693,16 +665,21 @@ def train_srpinn(model, train_loader, val_dataset, colloc_loader, n_epochs, devi
 
 # ---------------------- Пример запуска ----------------------
 if __name__ == "__main__":
-    # Параметры
     data_dir = path_to_files
-    csv_coarse = path_to_files + "results_coarse_0001_0001.csv"
-    csv_fine = path_to_files + "results_fine_0001_0001.csv"   # если есть
-    ids_train = [1]#,2,3,4,5]
-    ids_val = [1]#[6,7]
+
+    # Определяем все ID, для которых есть coarse файлы (1..100)
+    coarse_ids = list(range(1, 101))
+    # Fine файлы есть для подмножества: нужно автоматически определить из наличия файлов
+    fine_ids = []
+    for i in range(1, 101):
+        fname = os.path.join(data_dir, f'pinndata_quick_id_{i:04d}_fine.mat')
+        if os.path.exists(fname):
+            fine_ids.append(i)
+    print(f"Найдено fine файлов для ID: {fine_ids}")
 
     # Подготовка данных
     train_dataset, val_dataset, colloc_dataset, stats = prepare_datasets(
-        data_dir, csv_coarse, csv_fine, ids_train, ids_val, n_neighbors=8
+        data_dir, coarse_ids, fine_ids, n_neighbors=8
     )
 
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
@@ -722,4 +699,4 @@ if __name__ == "__main__":
     model.to(device)
 
     # Обучение
-    train_srpinn(model, train_loader, val_dataset, colloc_loader, n_epochs=5, device=device)
+    train_srpinn(model, train_loader, val_dataset, colloc_loader, n_epochs=200, device=device)
