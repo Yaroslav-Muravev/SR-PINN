@@ -571,7 +571,9 @@ def compute_voltage_error(model, val_dataset, device, verbose=False):
             fields_std = val_dataset.fields_std
             pred_fields_denorm = pred_fields * fields_std + fields_mean
 
-            phi_re = pred_fields_denorm[:, 6]
+            #phi_re = pred_fields_denorm[:, 6]
+            # Сделали комплексным
+            phi_pred = pred_fields_denorm[:, 6] + 1j * pred_fields_denorm[:, 7]
 
             id_idx = val_dataset.id_to_index[id_]
             bottom_mask = val_dataset.bottom_mask_list[id_idx]
@@ -589,7 +591,7 @@ def compute_voltage_error(model, val_dataset, device, verbose=False):
             row = val_dataset.df[val_dataset.df['id'] == id_].iloc[0]
             V_true = row['voltage_complex']
 
-            error = abs(V_pred - V_true.real) / (abs(V_true.real) + 1e-8)
+            error = abs(V_pred - V_true.real) / (abs(V_true.real) + 1e-15)
             errors.append(error)
 
             if verbose and id_ == ids_val[0]:
