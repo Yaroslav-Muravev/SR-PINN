@@ -345,22 +345,22 @@ def collect_voltages(model, dataset, device):
             pred = model(coords, shape, patch).cpu().numpy()
         # Денормализация
         pred_denorm = pred * dataset.fields_std + dataset.fields_mean
-        phi_re = pred_denorm[:, 6]
+        phi_pred = pred_denorm[:, 6] + 1j * pred_denorm[:, 7]
         # Маски
         id_idx = dataset.id_to_index[id_]
         bottom_mask = dataset.bottom_mask_list[id_idx]
         top_mask = dataset.top_mask_list[id_idx]
-        phi_bottom = phi_re[bottom_mask].mean()
-        phi_top = phi_re[top_mask].mean()
+        phi_bottom = phi_pred[bottom_mask].mean()
+	  phi_top = phi_pred[top_mask].mean()
         V_pred = phi_top - phi_bottom
         V_true = dataset.df[dataset.df['id'] == id_].iloc[0]['voltage_complex']
         V_preds.append(V_pred)
-        V_trues.append(V_true.real)  # пока только действительная часть
+        V_trues.append(V_true)
     return np.array(V_preds), np.array(V_trues)
 
 
 V_preds, V_trues = collect_voltages(model, val_dataset, device)
-relative_errors = np.abs(V_preds - V_trues) / (np.abs(V_trues) + 1e-12)
+relative_errors = np.abs(V_preds - V_trues) / (np.abs(V_trues) + 1e-15)
 
 # График scatter
 plt.figure(figsize=(8, 6))
@@ -386,77 +386,159 @@ plt.show()
 
 # Также можно построить boxplot ошибок по ID (если есть повторяющиеся измерения)
 
-# Визуализация поля для нескольких ID (например, первые 3)
-for id_ in fine_ids[:3]:
-    # Загружаем fine сетку и поле phi из .mat
-    fine_data = load_fine_data_for_id(id_)
-    if fine_data is None:
-        continue
-    fine_coords, fine_fields, shape3d = fine_data
-    phi_true = fine_fields[:, 6]  # действительная часть phi
-    # Восстанавливаем 3D сетку
-    X_shape = shape3d
-    phi_true_3d = phi_true.reshape(X_shape)
-    # Предсказываем поле для всех точек этого ID
-    # Используем dataset для получения предсказаний в том же порядке, что и исходные точки.
-    # Для этого создадим отдельный датасет для одного ID с normalize=False? Нет, с normalize=True,
-    # но тогда нужно применить обратную нормализацию.
-    # Проще: используем уже имеющийся dataset и вытащим предсказания для этого ID в правильном порядке.
-    slc = val_dataset.get_id_slice(id_)
+def visualize_fields_for_id(id_, model, device, dataset, data_dir):
+    fname = os.path.join(data_dir, f'pinndata_quick_id_{id_:04d}_fine.mat')
+    with h5py.File(fname, 'r') as f:
+        X = f['X'][:]
+        Y = f['Y'][:]
+        Z = f['Z'][:]
+        phi = load_complex_from_h5(f, 'phi')
+
+    phi_true = phi.real
+
+    # Берём все точки этого ID в правильном порядке
+    slc = dataset.get_id_slice(id_)
     indices = list(range(slc.start, slc.stop))
-    # Порядок индексов в dataset должен соответствовать порядку точек в .mat, если датасет не перемешивался.
-    # В нашем dataset порядок сохраняется, потому что мы не делали shuffle при создании индексов.
-    # Проверим: в CylinderStressDataset точки идут последовательно по ID, и внутри ID – в порядке flatten.
-    # Значит, предсказания для этого ID можно получить в том же порядке.
+
     batch_coords = []
     batch_shape = []
     batch_patch = []
     for idx in indices:
-        item = val_dataset[idx]
+        item = dataset[idx]
         batch_coords.append(item['coords'].unsqueeze(0))
         batch_shape.append(item['shape_params'].unsqueeze(0))
         batch_patch.append(item['coarse_patch'].unsqueeze(0))
+
     coords = torch.cat(batch_coords, dim=0).to(device)
     shape = torch.cat(batch_shape, dim=0).to(device)
     patch = torch.cat(batch_patch, dim=0).to(device)
+
     with torch.no_grad():
         pred = model(coords, shape, patch).cpu().numpy()
-    pred_denorm = pred * val_dataset.fields_std + val_dataset.fields_mean
-    phi_pred = pred_denorm[:, 6]
-    phi_pred_3d = phi_pred.reshape(X_shape)
 
-    # Визуализируем срез (например, на верхнем торце)
-    # Найдём индекс z-слоя, соответствующего верхней грани (z_max)
-    z_vals = fine_coords[:, 2].reshape(X_shape)
-    z_max = z_vals.max()
-    # Ищем слой с максимальным z (с допуском)
-    eps = 1e-6 * (z_max - z_vals.min())
-    top_layer = np.abs(z_vals - z_max) < eps
-    if not np.any(top_layer):
-        # если нет точного совпадения, берём ближайший
-        idx_z = np.argmin(np.abs(z_vals[0, 0, :] - z_max))
-        top_layer = np.zeros(z_vals.shape, dtype=bool)
-        top_layer[:, :, idx_z] = True
-    # Берём срез
-    phi_true_top = phi_true_3d[top_layer]
-    phi_pred_top = phi_pred_3d[top_layer]
-    # Координаты X,Y для этого слоя
-    X_plane = fine_coords[:, 0].reshape(X_shape)[top_layer]
-    Y_plane = fine_coords[:, 1].reshape(X_shape)[top_layer]
+    pred_denorm = pred * dataset.fields_std + dataset.fields_mean
+    phi_pred_flat = pred_denorm[:, 6]
+    phi_pred = phi_pred_flat.reshape(X.shape)
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    sc1 = axes[0].scatter(X_plane, Y_plane, c=phi_true_top, cmap='viridis', s=2)
-    axes[0].set_title(f'ID {id_}: Истинное поле phi (верхний торец)')
-    axes[0].set_xlabel('x (м)')
-    axes[0].set_ylabel('y (м)')
-    plt.colorbar(sc1, ax=axes[0], label='phi (В)')
+    # Верхний торец
+    phi_true_top = phi_true[:, :, -1]
+    phi_pred_top = phi_pred[:, :, -1]
+    X_top = X[:, :, -1]
+    Y_top = Y[:, :, -1]
 
-    sc2 = axes[1].scatter(X_plane, Y_plane, c=phi_pred_top, cmap='viridis', s=2)
-    axes[1].set_title(f'ID {id_}: Предсказанное поле phi (верхний торец)')
-    axes[1].set_xlabel('x (м)')
-    axes[1].set_ylabel('y (м)')
-    plt.colorbar(sc2, ax=axes[1], label='phi (В)')
+    # Относительная ошибка
+    eps = 1e-12
+    rel_error = np.abs(phi_true_top - phi_pred_top) / np.maximum(np.abs(phi_true_top), eps)
+
+    # Для scatter нужен плоский вид
+    x = X_top.ravel()
+    y = Y_top.ravel()
+    true_vals = phi_true_top.ravel()
+    pred_vals = phi_pred_top.ravel()
+    rel_vals = rel_error.ravel()
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+
+    s1 = axes[0].scatter(x, y, c=true_vals, s=6, cmap='RdBu_r')
+    axes[0].set_title(f'ID {id_}: истинное phi')
+    axes[0].set_xlabel('x')
+    axes[0].set_ylabel('y')
+    axes[0].set_aspect('equal')
+    plt.colorbar(s1, ax=axes[0], label='phi')
+
+    s2 = axes[1].scatter(x, y, c=pred_vals, s=6, cmap='RdBu_r')
+    axes[1].set_title(f'ID {id_}: предсказанное phi')
+    axes[1].set_xlabel('x')
+    axes[1].set_ylabel('y')
+    axes[1].set_aspect('equal')
+    plt.colorbar(s2, ax=axes[1], label='phi')
+
+    s3 = axes[2].scatter(x, y, c=rel_vals, s=6, cmap='hot', vmin=0.0, vmax=1.0)
+    axes[2].set_title('Относительная ошибка |true - pred| / max(|true|, eps)')
+    axes[2].set_xlabel('x')
+    axes[2].set_ylabel('y')
+    axes[2].set_aspect('equal')
+    plt.colorbar(s3, ax=axes[2], label='relative error')
 
     plt.tight_layout()
-    plt.savefig(f'phi_comparison_id_{id_}.png')
-    plt.show()
+    plt.savefig(f'phi_comparison_relative_id_{id_}.png', dpi=150)
+    plt.show(block=True)
+    plt.close(fig)
+
+## Визуализация поля для нескольких ID (например, первые 3)
+##for id_ in fine_ids[:3]:
+##    # Загружаем fine сетку и поле phi из .mat
+##    fine_data = load_fine_data_for_id(id_)
+##    if fine_data is None:
+##        continue
+##    fine_coords, fine_fields, shape3d = fine_data
+##    phi_true = fine_fields[:, 6]  # действительная часть phi
+##    # Восстанавливаем 3D сетку
+##    X_shape = shape3d
+##    phi_true_3d = phi_true.reshape(X_shape)
+##    # Предсказываем поле для всех точек этого ID
+##    # Используем dataset для получения предсказаний в том же порядке, что и исходные точки.
+##    # Для этого создадим отдельный датасет для одного ID с normalize=False? Нет, с normalize=True,
+##    # но тогда нужно применить обратную нормализацию.
+##    # Проще: используем уже имеющийся dataset и вытащим предсказания для этого ID в правильном порядке.
+##    slc = val_dataset.get_id_slice(id_)
+##    indices = list(range(slc.start, slc.stop))
+##    # Порядок индексов в dataset должен соответствовать порядку точек в .mat, если датасет не перемешивался.
+##    # В нашем dataset порядок сохраняется, потому что мы не делали shuffle при создании индексов.
+##    # Проверим: в CylinderStressDataset точки идут последовательно по ID, и внутри ID – в порядке flatten.
+##    # Значит, предсказания для этого ID можно получить в том же порядке.
+##    batch_coords = []
+##    batch_shape = []
+##    batch_patch = []
+##    for idx in indices:
+##        item = val_dataset[idx]
+##        batch_coords.append(item['coords'].unsqueeze(0))
+##        batch_shape.append(item['shape_params'].unsqueeze(0))
+##        batch_patch.append(item['coarse_patch'].unsqueeze(0))
+##    coords = torch.cat(batch_coords, dim=0).to(device)
+##    shape = torch.cat(batch_shape, dim=0).to(device)
+##    patch = torch.cat(batch_patch, dim=0).to(device)
+##    with torch.no_grad():
+##        pred = model(coords, shape, patch).cpu().numpy()
+##    pred_denorm = pred * val_dataset.fields_std + val_dataset.fields_mean
+##    phi_pred = pred_denorm[:, 6]
+##    phi_pred_3d = phi_pred.reshape(X_shape)
+##
+##    # Визуализируем срез (например, на верхнем торце)
+##    # Найдём индекс z-слоя, соответствующего верхней грани (z_max)
+##    z_vals = fine_coords[:, 2].reshape(X_shape)
+##    z_max = z_vals.max()
+##    # Ищем слой с максимальным z (с допуском)
+##    eps = 1e-6 * (z_max - z_vals.min())
+##    top_layer = np.abs(z_vals - z_max) < eps
+##    if not np.any(top_layer):
+##        # если нет точного совпадения, берём ближайший
+##        idx_z = np.argmin(np.abs(z_vals[0, 0, :] - z_max))
+##        top_layer = np.zeros(z_vals.shape, dtype=bool)
+##        top_layer[:, :, idx_z] = True
+##    # Берём срез
+##    phi_true_top = phi_true_3d[top_layer]
+##    phi_pred_top = phi_pred_3d[top_layer]
+##    # Координаты X,Y для этого слоя
+##    X_plane = fine_coords[:, 0].reshape(X_shape)[top_layer]
+##    Y_plane = fine_coords[:, 1].reshape(X_shape)[top_layer]
+##
+##    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+##    sc1 = axes[0].scatter(X_plane, Y_plane, c=phi_true_top, cmap='viridis', s=2)
+##    axes[0].set_title(f'ID {id_}: Истинное поле phi (верхний торец)')
+##    axes[0].set_xlabel('x (м)')
+##    axes[0].set_ylabel('y (м)')
+##    plt.colorbar(sc1, ax=axes[0], label='phi (В)')
+##
+##    sc2 = axes[1].scatter(X_plane, Y_plane, c=phi_pred_top, cmap='viridis', s=2)
+##    axes[1].set_title(f'ID {id_}: Предсказанное поле phi (верхний торец)')
+##    axes[1].set_xlabel('x (м)')
+##    axes[1].set_ylabel('y (м)')
+##    plt.colorbar(sc2, ax=axes[1], label='phi (В)')
+##
+##    plt.tight_layout()
+##    plt.savefig(f'phi_comparison_id_{id_}.png')
+##    plt.show()
+
+for id_ in fine_ids[:3]:
+    visualize_fields_for_id(id_, model, device, val_dataset, data_dir)

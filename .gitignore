@@ -2,3 +2,4 @@ files/
 .idea/
 __pycache__/
 *.zip
+*.png
