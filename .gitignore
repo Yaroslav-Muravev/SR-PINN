@@ -1,3 +1,4 @@
 files/
-*.pth
+.idea/
+__pycache__/
 *.zip
