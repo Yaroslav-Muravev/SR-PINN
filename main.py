@@ -306,8 +306,8 @@ class SRPINN(nn.Module):
                  n_shape_params: int = 2,
                  n_coarse_nodes: int = 8,
                  n_field_vars: int = 8,
-                 hidden_dim: int = 384,      # увеличено для стабильности
-                 n_blocks: int = 10,         # увеличено
+                 hidden_dim: int = 256,      # увеличено для стабильности
+                 n_blocks: int = 6,         # увеличено
                  fourier_mapping_size: int = 128,
                  fourier_scale: float = 5.0):
         super().__init__()
@@ -344,53 +344,25 @@ class SRPINN(nn.Module):
 # ---------------------- Функция потерь (с PINN-регуляризацией + voltage supervision) ----------------------
 # ---------------------- Функция потерь (финальная версия) ----------------------
 class StressPINNLoss(nn.Module):
-    def __init__(self, lambda_data: float = 1.0, lambda_pde: float = 0.05, lambda_voltage: float = 15.0):
+    def __init__(self, lambda_data: float = 1.0):
         super().__init__()
         self.lambda_data = lambda_data
-        self.lambda_pde = lambda_pde
-        self.lambda_voltage = lambda_voltage
         self.mse = nn.MSELoss()
 
     def forward(self, model, batch, batch_pde=None):
         device = next(model.parameters()).device
         loss_data = torch.tensor(0.0, device=device)
-        loss_pde = torch.tensor(0.0, device=device)
-        loss_voltage = torch.tensor(0.0, device=device)
 
         if 'target' in batch:
             pred = model(batch['coords'], batch['shape_params'], batch['coarse_patch'])
             loss_data = self.mse(pred, batch['target'])
 
-        # Voltage supervision (исправленная версия)
-        if 'target' in batch and 'fields_mean' in batch and 'fields_std' in batch:
-            phi_pred_norm = pred[:, 6:8]
-            phi_true_norm = batch['target'][:, 6:8]
+        # NO voltage term here (it was broken)
+        # NO PDE term here (it was harmful)
 
-            # Переносим статистики на тот же device, что и модель
-            fields_mean = batch['fields_mean'][0].to(device)
-            fields_std  = batch['fields_std'][0].to(device)
-
-            phi_pred = phi_pred_norm * fields_std[6:8] + fields_mean[6:8]
-            phi_true = phi_true_norm * fields_std[6:8] + fields_mean[6:8]
-
-            V_pred_proxy = phi_pred[:, 1].mean() - phi_pred[:, 0].mean()
-            V_true_proxy = phi_true[:, 1].mean() - phi_true[:, 0].mean()
-
-            loss_voltage = self.mse(V_pred_proxy, V_true_proxy) + 0.1 * torch.abs(V_pred_proxy - V_true_proxy)
-
-        # 3. PDE regularization на collocation points
-        if batch_pde is not None:
-            pred_pde = model(batch_pde['coords'], batch_pde['shape_params'], batch_pde['coarse_patch'])
-            loss_pde = self.mse(pred_pde, torch.zeros_like(pred_pde))
-
-        total_loss = (self.lambda_data * loss_data +
-                      self.lambda_pde * loss_pde +
-                      self.lambda_voltage * loss_voltage)
-
+        total_loss = self.lambda_data * loss_data
         return total_loss, {
             'loss_data': loss_data.item(),
-            'loss_pde': loss_pde.item(),
-            'loss_voltage': loss_voltage.item(),
             'total_loss': total_loss.item()
         }
 
@@ -453,7 +425,7 @@ def prepare_datasets(data_dir: str,
         n_neighbors=n_neighbors,
         normalize=True,
         external_stats=external_stats,
-        subsample_ratio=0.3          # ускорение обучения
+        subsample_ratio=1.0          # ускорение обучения
     )
 
     val_dataset = CylinderStressDataset(
@@ -612,8 +584,8 @@ def compute_voltage_error(model, val_dataset, device, verbose=False):
 def train_srpinn(model, train_loader, val_dataset, colloc_loader, n_epochs, device, lr=5e-4, pde_every=5):
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
-    criterion = StressPINNLoss(lambda_data=1.0, lambda_pde=0.05, lambda_voltage=15.0)
-
+    #criterion = StressPINNLoss(lambda_data=1.0, lambda_pde=0.05, lambda_voltage=15.0)
+    criterion = StressPINNLoss(lambda_data=1.0)
     best_voltage_error = float('inf')
     colloc_iter = iter(colloc_loader)
     step_counter = 0
@@ -678,8 +650,8 @@ if __name__ == "__main__":
     coarse_ids = list(range(1, 101))
 
     # === ИСПРАВЛЕННОЕ РАЗДЕЛЕНИЕ ===
-    train_ids = [1, 3, 5, 11, 12, 13]   # обучение
-    val_ids   = [15]                     # валидация (отдельный ID!)
+    train_ids = [1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13]   # обучение
+    val_ids   = [14, 15]                     # валидация (отдельный ID!)
     test_ids  = [45, 46, 62, 75, 83, 86] # тест
 
     print(f"Train IDs: {train_ids}")
