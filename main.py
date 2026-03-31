@@ -161,7 +161,7 @@ class CylinderStressDataset(Dataset):
 
             coords, fields = load_mat_with_cache(id_, mesh_type, self.data_dir)
 
-            z_vals = Z.ravel()
+            z_vals = coords[:, 2]
             z_min = z_vals.min();
             z_max = z_vals.max()
             self.z_min_list.append(z_min);
