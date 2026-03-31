@@ -12,6 +12,69 @@ import h5py
 from typing import Optional, Tuple, List, Dict
 
 path_to_files = "./files/"
+CACHE_DIR = './cache'
+
+_MAT_CACHE = {}
+
+def load_mat_with_cache(id_: int, mesh_type: str, data_dir: str) -> tuple:
+    """
+    Возвращает (coords, fields) для указанного ID и типа сетки.
+    Использует кэширование в папке CACHE_DIR.
+    """
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_file = os.path.join(CACHE_DIR, f'id_{id_:04d}_{mesh_type}.npz')
+
+    key = (id_, mesh_type)
+    if key in _MAT_CACHE:
+        return _MAT_CACHE[key]
+
+    if os.path.exists(cache_file):
+        data = np.load(cache_file)
+        coords = data['coords']
+        fields = data['fields']
+        return coords, fields
+
+    # Кэша нет — читаем .mat
+    mat_file = os.path.join(data_dir, f'pinndata_quick_id_{id_:04d}_{mesh_type}.mat')
+    if not os.path.exists(mat_file):
+        raise FileNotFoundError(f"File {mat_file} not found")
+
+    with h5py.File(mat_file, 'r') as f:
+        X = f['X'][:]
+        Y = f['Y'][:]
+        Z = f['Z'][:]
+        ux = load_complex_from_h5(f, 'ux')
+        uy = load_complex_from_h5(f, 'uy')
+        uz = load_complex_from_h5(f, 'uz')
+        phi = load_complex_from_h5(f, 'phi')
+
+    coords = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
+    fields = np.stack([
+        ux.real.ravel(), ux.imag.ravel(),
+        uy.real.ravel(), uy.imag.ravel(),
+        uz.real.ravel(), uz.imag.ravel(),
+        phi.real.ravel(), phi.imag.ravel()
+    ], axis=1)
+
+    # Сохраняем в кэш
+    np.savez_compressed(cache_file, coords=coords, fields=fields)
+    _MAT_CACHE[key] = (coords, fields)
+    return coords, fields
+
+
+def load_all_csv_cached(data_dir: str, pattern: str, cache_name: str) -> pd.DataFrame:
+    cache_file = os.path.join(CACHE_DIR, f'{cache_name}.parquet')
+    if os.path.exists(cache_file):
+        return pd.read_parquet(cache_file)
+
+    # Читаем все CSV
+    csv_files = glob.glob(os.path.join(data_dir, f"{pattern}*.csv"))
+    df_list = [pd.read_csv(f) for f in csv_files]
+    df = pd.concat(df_list, ignore_index=True)
+
+    # Сохраняем в кэш
+    df.to_parquet(cache_file)
+    return df
 
 # ---------------------- Вспомогательные функции ----------------------
 def parse_complex(s: str) -> complex:
@@ -28,6 +91,7 @@ def parse_complex(s: str) -> complex:
         except:
             return complex(np.nan, np.nan)
 
+
 def load_complex_from_h5(f, key: str) -> np.ndarray:
     data = f[key][:]
     if data.dtype.fields:
@@ -35,8 +99,10 @@ def load_complex_from_h5(f, key: str) -> np.ndarray:
     else:
         return data
 
+
 def build_kdtree(coords: np.ndarray) -> cKDTree:
     return cKDTree(coords)
+
 
 def find_coarse_patch(coarse_tree: cKDTree, coarse_coords: np.ndarray,
                       coarse_fields: np.ndarray, query_point: np.ndarray, n_neighbors: int = 8) -> np.ndarray:
@@ -48,6 +114,7 @@ def find_coarse_patch(coarse_tree: cKDTree, coarse_coords: np.ndarray,
     patch = np.concatenate([neighbor_fields.ravel(), rel_coords.ravel()])
     return patch
 
+
 # ---------------------- Загрузка CSV ----------------------
 def load_all_csv(data_dir: str, pattern: str) -> pd.DataFrame:
     csv_files = glob.glob(os.path.join(data_dir, f"{pattern}*.csv"))
@@ -55,6 +122,7 @@ def load_all_csv(data_dir: str, pattern: str) -> pd.DataFrame:
         return pd.DataFrame()
     df_list = [pd.read_csv(f) for f in csv_files]
     return pd.concat(df_list, ignore_index=True)
+
 
 # ---------------------- Датасеты (без изменений) ----------------------
 class CylinderStressDataset(Dataset):
@@ -90,21 +158,14 @@ class CylinderStressDataset(Dataset):
             if not os.path.exists(fname):
                 print(f"Warning: file {fname} not found, skipping id {id_}")
                 continue
-            with h5py.File(fname, 'r') as f:
-                X = f['X'][:]; Y = f['Y'][:]; Z = f['Z'][:]
-                ux = load_complex_from_h5(f, 'ux')
-                uy = load_complex_from_h5(f, 'uy')
-                uz = load_complex_from_h5(f, 'uz')
-                phi = load_complex_from_h5(f, 'phi')
-            coords = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
-            fields = np.stack([ux.real.ravel(), ux.imag.ravel(),
-                               uy.real.ravel(), uy.imag.ravel(),
-                               uz.real.ravel(), uz.imag.ravel(),
-                               phi.real.ravel(), phi.imag.ravel()], axis=1)
+
+            coords, fields = load_mat_with_cache(id_, mesh_type, self.data_dir)
 
             z_vals = Z.ravel()
-            z_min = z_vals.min(); z_max = z_vals.max()
-            self.z_min_list.append(z_min); self.z_max_list.append(z_max)
+            z_min = z_vals.min();
+            z_max = z_vals.max()
+            self.z_min_list.append(z_min);
+            self.z_max_list.append(z_max)
             eps_z = 1e-6 * (z_max - z_min)
             bottom_mask = np.abs(z_vals - z_min) < eps_z
             top_mask = np.abs(z_vals - z_max) < eps_z
@@ -139,18 +200,22 @@ class CylinderStressDataset(Dataset):
 
             if external_stats is not None:
                 self.fields_mean, self.fields_std = external_stats
-                print(f"Using external fields stats: mean[6]={self.fields_mean[6]:.3e}, std[6]={self.fields_std[6]:.3e}")
+                print(
+                    f"Using external fields stats: mean[6]={self.fields_mean[6]:.3e}, std[6]={self.fields_std[6]:.3e}")
             else:
                 all_fields = np.vstack(self.fields_list)
                 self.fields_mean = all_fields.mean(axis=0)
                 self.fields_std = all_fields.std(axis=0)
-                self.fields_std = np.maximum(self.fields_std, 1e-20)   # мягкий clamp
+                self.fields_std = np.maximum(self.fields_std, 1e-20)  # мягкий clamp
                 print(f"Computed from fine: mean[6]={self.fields_mean[6]:.3e}, std[6]={self.fields_std[6]:.3e}")
         else:
             # fallback
-            self.coords_mean = np.zeros(3); self.coords_std = np.ones(3)
-            self.shape_mean = np.zeros(2);  self.shape_std = np.ones(2)
-            self.fields_mean = np.zeros(8); self.fields_std = np.ones(8)
+            self.coords_mean = np.zeros(3);
+            self.coords_std = np.ones(3)
+            self.shape_mean = np.zeros(2);
+            self.shape_std = np.ones(2)
+            self.fields_mean = np.zeros(8);
+            self.fields_std = np.ones(8)
 
         self.coarse_trees = None
         self.coarse_coords = None
@@ -206,8 +271,9 @@ class CylinderStressDataset(Dataset):
             'target': torch.tensor(fields, dtype=torch.float32),
             'id': id_,
             'fields_mean': torch.tensor(self.fields_mean, dtype=torch.float32),
-            'fields_std':  torch.tensor(self.fields_std,  dtype=torch.float32)
+            'fields_std': torch.tensor(self.fields_std, dtype=torch.float32)
         }
+
 
 # ---------------------- Датасет для коллокационных точек ----------------------
 class CollocationDataset(Dataset):
@@ -270,6 +336,7 @@ class CollocationDataset(Dataset):
             'id': id_
         }
 
+
 # ---------------------- Модель SR-PINN ----------------------
 class FourierFeatureEmbedding(nn.Module):
     def __init__(self, input_dim: int, mapping_size: int = 128, scale: float = 10.0):
@@ -279,6 +346,7 @@ class FourierFeatureEmbedding(nn.Module):
     def forward(self, x):
         x_proj = 2 * np.pi * x @ self.B
         return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
+
 
 class ResidualBlock(nn.Module):
     def __init__(self, dim: int):
@@ -300,14 +368,15 @@ class ResidualBlock(nn.Module):
         x = self.linear2(x)
         return x + residual
 
+
 class SRPINN(nn.Module):
     def __init__(self,
                  n_spatial: int = 3,
                  n_shape_params: int = 2,
                  n_coarse_nodes: int = 8,
                  n_field_vars: int = 8,
-                 hidden_dim: int = 256,      # увеличено для стабильности
-                 n_blocks: int = 6,         # увеличено
+                 hidden_dim: int = 256,  # увеличено для стабильности
+                 n_blocks: int = 6,  # увеличено
                  fourier_mapping_size: int = 128,
                  fourier_scale: float = 5.0):
         super().__init__()
@@ -341,6 +410,7 @@ class SRPINN(nn.Module):
         out = self.output_proj(x)
         return out
 
+
 # ---------------------- Функция потерь (с PINN-регуляризацией + voltage supervision) ----------------------
 # ---------------------- Функция потерь (финальная версия) ----------------------
 class StressPINNLoss(nn.Module):
@@ -366,8 +436,7 @@ class StressPINNLoss(nn.Module):
             'total_loss': total_loss.item()
         }
 
-# ---------------------- Подготовка данных (ИСПРАВЛЕНА: отдельные train/val) ----------------------
-# ---------------------- Подготовка данных (ПОЛНАЯ ИСПРАВЛЕННАЯ ВЕРСИЯ) ----------------------
+
 def prepare_datasets(data_dir: str,
                      coarse_ids: List[int],
                      train_ids: List[int],
@@ -378,36 +447,27 @@ def prepare_datasets(data_dir: str,
     - Статистика mean/std для полей считается ТОЛЬКО по fine-данным (target)
     - Coarse-данные используются только для patch (не для статистики)
     """
-    fine_df = load_all_csv(data_dir, 'results_fine')
-    coarse_df = load_all_csv(data_dir, 'results_coarse')
+    fine_df = load_all_csv_cached(data_dir, 'results_fine', 'fine_df')
+    coarse_df = load_all_csv_cached(data_dir, 'results_coarse', 'coarse_df')
 
     if fine_df.empty:
         raise ValueError("Не найдены results_fine*.csv")
 
     # === 1. Статистика полей — ТОЛЬКО ПО FINE-ДАННЫМ (целевая правда) ===
     all_fine_fields = []
-    for id_ in train_ids:                     # только train, чтобы не было утечки
+    for id_ in train_ids:  # только train, чтобы не было утечки
         fname = os.path.join(data_dir, f'pinndata_quick_id_{id_:04d}_fine.mat')
         if not os.path.exists(fname):
             continue
-        with h5py.File(fname, 'r') as f:
-            ux = load_complex_from_h5(f, 'ux')
-            uy = load_complex_from_h5(f, 'uy')
-            uz = load_complex_from_h5(f, 'uz')
-            phi = load_complex_from_h5(f, 'phi')
-        fields = np.stack([
-            ux.real.ravel(), ux.imag.ravel(),
-            uy.real.ravel(), uy.imag.ravel(),
-            uz.real.ravel(), uz.imag.ravel(),
-            phi.real.ravel(), phi.imag.ravel()
-        ], axis=1)
+
+        _, fields = load_mat_with_cache(id_, "fine", data_dir)
         all_fine_fields.append(fields)
 
     if all_fine_fields:
         all_fields_stack = np.vstack(all_fine_fields)
         fields_mean = all_fields_stack.mean(axis=0)
         fields_std = all_fields_stack.std(axis=0)
-        fields_std = np.maximum(fields_std, 1e-20)          # мягкий clamp — phi не обнуляется
+        fields_std = np.maximum(fields_std, 1e-20)
         print(f"Fields stats FROM FINE data: mean[6]={fields_mean[6]:.3e}, "
               f"std[6]={fields_std[6]:.3e} | mean[7]={fields_mean[7]:.3e}, std[7]={fields_std[7]:.3e}")
     else:
@@ -425,7 +485,7 @@ def prepare_datasets(data_dir: str,
         n_neighbors=n_neighbors,
         normalize=True,
         external_stats=external_stats,
-        subsample_ratio=1.0          # ускорение обучения
+        subsample_ratio=1.0  # ускорение обучения
     )
 
     val_dataset = CylinderStressDataset(
@@ -436,7 +496,7 @@ def prepare_datasets(data_dir: str,
         n_neighbors=n_neighbors,
         normalize=True,
         external_stats=external_stats,
-        subsample_ratio=1.0          # полная валидация
+        subsample_ratio=1.0  # полная валидация
     )
 
     # === 3. Загружаем coarse-данные только для train + val ===
@@ -450,21 +510,7 @@ def prepare_datasets(data_dir: str,
         if not os.path.exists(fname):
             print(f"Warning: coarse file for ID {id_} not found")
             continue
-        with h5py.File(fname, 'r') as f:
-            X = f['X'][:]
-            Y = f['Y'][:]
-            Z = f['Z'][:]
-            ux = load_complex_from_h5(f, 'ux')
-            uy = load_complex_from_h5(f, 'uy')
-            uz = load_complex_from_h5(f, 'uz')
-            phi = load_complex_from_h5(f, 'phi')
-        coords = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
-        fields = np.stack([
-            ux.real.ravel(), ux.imag.ravel(),
-            uy.real.ravel(), uy.imag.ravel(),
-            uz.real.ravel(), uz.imag.ravel(),
-            phi.real.ravel(), phi.imag.ravel()
-        ], axis=1)
+        coords, fields = load_mat_with_cache(id_, "coarse", data_dir)
         coarse_coords_list.append(coords)
         coarse_fields_list.append(fields)
         coarse_id_list.append(id_)
@@ -532,6 +578,7 @@ def prepare_datasets(data_dir: str,
 
     return train_dataset, val_dataset, colloc_dataset, stats
 
+
 # ---------------------- Вычисление ошибки напряжения ----------------------
 def compute_voltage_error(model, val_dataset, device, verbose=False):
     model.eval()
@@ -580,11 +627,12 @@ def compute_voltage_error(model, val_dataset, device, verbose=False):
                 print(f"  relative error = {error:.4f}")
     return np.mean(errors) if errors else float('inf')
 
+
 # ---------------------- Обучение ----------------------
 def train_srpinn(model, train_loader, val_dataset, colloc_loader, n_epochs, device, lr=5e-4, pde_every=5):
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
-    #criterion = StressPINNLoss(lambda_data=1.0, lambda_pde=0.05, lambda_voltage=15.0)
+    # criterion = StressPINNLoss(lambda_data=1.0, lambda_pde=0.05, lambda_voltage=15.0)
     criterion = StressPINNLoss(lambda_data=1.0)
     best_voltage_error = float('inf')
     colloc_iter = iter(colloc_loader)
@@ -644,15 +692,49 @@ def train_srpinn(model, train_loader, val_dataset, colloc_loader, n_epochs, devi
                 torch.save(model.state_dict(), 'best_srpinn_model_voltage.pth')
                 print(f"  >>> Saved best model (voltage error {best_voltage_error:.4f}) <<<")
 
+
+def parse_idx_train(data_dir: str) -> Tuple[List[int], List[int], List[int]]:
+    """
+    Parse directory contents to extract numeric IDs from files matching the pattern
+    '*id_<number>_fine*.mat'. The IDs are sorted and split into train (60%),
+    validation (20%) and test (20%) sets.
+
+    Args:
+        data_dir: Path to the directory containing the files.
+
+    Returns:
+        A tuple of three lists: (train_ids, val_ids, test_ids).
+    """
+
+    directory_contents = os.listdir(data_dir)
+    pattern = re.compile(r'id_(\d+)_fine.*\.mat$')
+
+    ids = []
+    for file in directory_contents:
+        match = pattern.search(file)
+        if match:
+            ids.append(int(match.group(1)))
+
+    ids_sorted = sorted(set(ids))
+
+    n = len(ids_sorted)
+
+    test_split = n // 5
+    val_split = 2 * n // 5
+
+    test_ids = ids_sorted[:test_split]
+    val_ids = ids_sorted[test_split:val_split]
+    train_ids = ids_sorted[val_split:]
+
+    return train_ids, val_ids, test_ids
+
+
 # ---------------------- Запуск ----------------------
 if __name__ == "__main__":
     data_dir = path_to_files
     coarse_ids = list(range(1, 101))
 
-    # === ИСПРАВЛЕННОЕ РАЗДЕЛЕНИЕ ===
-    train_ids = [1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13]   # обучение
-    val_ids   = [14, 15]                     # валидация (отдельный ID!)
-    test_ids  = [45, 46, 62, 75, 83, 86] # тест
+    train_ids, val_ids, test_ids = parse_idx_train(data_dir)
 
     print(f"Train IDs: {train_ids}")
     print(f"Val   IDs: {val_ids}")
