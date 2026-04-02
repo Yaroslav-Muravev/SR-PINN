@@ -14,6 +14,8 @@ from typing import Optional, Tuple, List, Dict, Iterable
 
 path_to_files = "./files/"
 CACHE_DIR = './cache'
+torch.set_float32_matmul_precision('high')
+torch._dynamo.config.disable = True
 
 _MAT_CACHE = {}
 
@@ -602,7 +604,8 @@ class SRPINN(nn.Module):
                  hidden_dim: int = 256,
                  n_blocks: int = 6,
                  fourier_mapping_size: int = 128,
-                 fourier_scale: float = 5.0):
+                 fourier_scale: float = 5.0,
+                 output_scale_init=100.0):
         super().__init__()
         self.n_coarse_nodes = n_coarse_nodes
         self.n_field_vars = n_field_vars
@@ -614,6 +617,7 @@ class SRPINN(nn.Module):
         self.input_proj = nn.Linear(fourier_dim + hidden_dim + hidden_dim, hidden_dim)
         self.blocks = nn.ModuleList([ResidualBlock(hidden_dim) for _ in range(n_blocks)])
         self.output_proj = nn.Linear(hidden_dim, n_field_vars)
+        self.output_scale = nn.Parameter(torch.tensor(output_scale_init, dtype=torch.float32))
         self._init_weights()
 
     def _init_weights(self):
@@ -632,6 +636,7 @@ class SRPINN(nn.Module):
         for block in self.blocks:
             x = block(x)
         out = self.output_proj(x)
+        out = out * self.output_scale
         return out
 
 

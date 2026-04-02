@@ -103,7 +103,7 @@ model = SRPINN(
     n_coarse_nodes=8,
     n_field_vars=8,
     hidden_dim=256,
-    n_blocks=6,
+    n_blocks=10,
 )
 # Загружаем веса (прямо state_dict, без обёртки)
 state_dict = torch.load(model_path, map_location=device)
