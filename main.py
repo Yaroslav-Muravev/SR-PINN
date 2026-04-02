@@ -9,7 +9,8 @@ import os
 import glob
 import re
 import h5py
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Iterable
+
 
 path_to_files = "./files/"
 CACHE_DIR = './cache'
@@ -76,9 +77,12 @@ def load_all_csv_cached(data_dir: str, pattern: str, cache_name: str) -> pd.Data
     df.to_parquet(cache_file)
     return df
 
+def to_device(batch, device):
+    """Переносит все тензоры в словаре на указанное устройство."""
+    if batch is None:
+        return None
+    return {k: v.to(device) if hasattr(v, 'to') else v for k, v in batch.items()}
 
-import numpy as np
-from typing import Iterable, Tuple, Optional
 
 def compute_stats_incremental(
     arrays: Iterable[np.ndarray],
@@ -148,8 +152,6 @@ def generate_fine_fields(train_ids, data_dir):
         _, fields = load_mat_with_cache(id_, "fine", data_dir)
         yield fields
 
-# ---------------------- Вспомогательные функции ----------------------
-
 def parse_complex(s):
     # Handle numeric inputs directly
     if isinstance(s, (int, float)):
@@ -196,8 +198,6 @@ def find_coarse_patch(coarse_tree: cKDTree, coarse_coords: np.ndarray,
     patch = np.concatenate([neighbor_fields.ravel(), rel_coords.ravel()])
     return patch
 
-
-# ---------------------- Загрузка CSV ----------------------
 def load_all_csv(data_dir: str, pattern: str) -> pd.DataFrame:
     csv_files = glob.glob(os.path.join(data_dir, f"{pattern}*.csv"))
     if not csv_files:
@@ -206,7 +206,6 @@ def load_all_csv(data_dir: str, pattern: str) -> pd.DataFrame:
     return pd.concat(df_list, ignore_index=True)
 
 
-# ---------------------- Датасеты (без изменений) ----------------------
 class CylinderStressDataset(Dataset):
     def __init__(self, data_dir: str, csv_df: pd.DataFrame, ids: List[int], mesh_type: str,
                  n_neighbors: int = 8, normalize: bool = True,
@@ -431,53 +430,135 @@ class CollocationDataset(Dataset):
                  shape_stats: Optional[Tuple[np.ndarray, np.ndarray]] = None,
                  fields_stats: Optional[Tuple[np.ndarray, np.ndarray]] = None):
         self.ids = ids
-        self.shape_params = shape_params
-        self.coarse_data = coarse_data
         self.n_points_per_id = n_points_per_id
         self.n_neighbors = n_neighbors
         self.normalize = normalize
+        self.total_points = len(ids) * n_points_per_id
+
+        # Статистики
         self.coords_mean, self.coords_std = coords_stats if coords_stats else (np.zeros(3), np.ones(3))
         self.shape_mean, self.shape_std = shape_stats if shape_stats else (np.zeros(2), np.ones(2))
         self.fields_mean, self.fields_std = fields_stats if fields_stats else (np.zeros(8), np.ones(8))
-        self.total_points = len(ids) * n_points_per_id
+
+        # Предвычисление констант для каждого ID
+        self.id_info = {}
+        for id_ in ids:
+            r_um, h_um = shape_params[id_]
+            R = r_um * 1e-6
+            H = h_um * 1e-6
+            z0 = -H / 2
+            tree, coarse_coords, coarse_fields = coarse_data[id_]
+            self.id_info[id_] = {
+                'r_um': r_um,
+                'h_um': h_um,
+                'R': R,
+                'H': H,
+                'z0': z0,
+                'tree': tree,
+                'coarse_coords': coarse_coords,
+                'coarse_fields': coarse_fields
+            }
 
     def __len__(self):
         return self.total_points
 
+    def __getitems__(self, indices):
+        """
+        Эффективно генерирует батч коллокационных точек.
+        Группирует запросы по ID, использует batch-запросы к KDTree.
+        """
+        if not indices:
+            return []
+
+        # Группируем индексы по ID
+        from collections import defaultdict
+        id_to_positions = defaultdict(list)   # id -> [(position_in_batch, local_idx), ...]
+        for pos, idx in enumerate(indices):
+            id_idx = idx // self.n_points_per_id
+            local_idx = idx % self.n_points_per_id
+            id_ = self.ids[id_idx]
+            id_to_positions[id_].append((pos, local_idx))
+
+        results = [None] * len(indices)
+
+        for id_, pos_list in id_to_positions.items():
+            info = self.id_info[id_]
+            r_um = info['r_um']
+            h_um = info['h_um']
+            R = info['R']
+            H = info['H']
+            z0 = info['z0']
+            tree = info['tree']
+            coarse_coords = info['coarse_coords']
+            coarse_fields = info['coarse_fields']
+
+            # Уникальные локальные индексы, для которых нужно сгенерировать точки
+            unique_locals = sorted(set(local_idx for _, local_idx in pos_list))
+            n_points = len(unique_locals)
+
+            # 1. Векторизованная генерация точек в цилиндре
+            u = np.random.random(n_points)
+            v = np.random.random(n_points)
+            w = np.random.random(n_points)
+            r = R * np.sqrt(u)
+            theta = 2 * np.pi * v
+            z = z0 + H * w
+            x = r * np.cos(theta)
+            y = r * np.sin(theta)
+            points = np.stack([x, y, z], axis=1)            # (n_points, 3)
+
+            # 2. Batch-запрос к KDTree
+            dists, idxs = tree.query(points, k=self.n_neighbors)   # (n_points, k), (n_points, k)
+
+            # 3. Извлечение данных соседей
+            neighbor_coords = coarse_coords[idxs]           # (n_points, k, 3)
+            neighbor_fields = coarse_fields[idxs]           # (n_points, k, 8)
+
+            # 4. Масштаб и относительные координаты
+            scale = np.mean(dists, axis=1, keepdims=True) + 1e-8   # (n_points, 1)
+            rel_coords = (neighbor_coords - points[:, np.newaxis, :]) / scale[..., np.newaxis]  # (n_points, k, 3)
+
+            # 5. Формирование патча
+            fields_flat = neighbor_fields.reshape(n_points, -1)     # (n_points, k*8)
+            rel_flat = rel_coords.reshape(n_points, -1)             # (n_points, k*3)
+            patches = np.concatenate([fields_flat, rel_flat], axis=1)  # (n_points, k*(8+3))
+
+            # 6. Нормализация (если нужно)
+            points_norm = points
+            if self.normalize:
+                points_norm = (points - self.coords_mean) / self.coords_std
+                # Нормализация полей внутри патча
+                n_fields_flat = self.n_neighbors * 8
+                patch_fields = patches[:, :n_fields_flat].reshape(n_points, self.n_neighbors, 8)
+                patch_rel = patches[:, n_fields_flat:].reshape(n_points, self.n_neighbors, 3)
+                patch_fields_norm = (patch_fields - self.fields_mean) / (self.fields_std + 1e-20)
+                patches = np.concatenate([
+                    patch_fields_norm.reshape(n_points, -1),
+                    patch_rel.reshape(n_points, -1)
+                ], axis=1)
+
+            # 7. Параметры формы (одинаковы для всех точек данного ID)
+            shape = np.array([r_um, h_um])
+            if self.normalize:
+                shape = (shape - self.shape_mean) / self.shape_std
+
+            # 8. Сопоставление сгенерированных точек с исходными позициями
+            # Создаём словарь local_idx -> (point, patch)
+            local_map = {local_idx: (points_norm[i], patches[i]) for i, local_idx in enumerate(unique_locals)}
+            for pos, local_idx in pos_list:
+                point, patch = local_map[local_idx]
+                results[pos] = {
+                    'coords': torch.tensor(point, dtype=torch.float32),
+                    'shape_params': torch.tensor(shape, dtype=torch.float32),
+                    'coarse_patch': torch.tensor(patch, dtype=torch.float32),
+                    'id': id_
+                }
+
+        return results
+
     def __getitem__(self, idx):
-        id_idx = idx // self.n_points_per_id
-        local_idx = idx % self.n_points_per_id
-        id_ = self.ids[id_idx]
-        r_um, h_um = self.shape_params[id_]
-        R = r_um * 1e-6
-        H = h_um * 1e-6
-        z0 = -H / 2
-        u = np.random.random()
-        v = np.random.random()
-        w = np.random.random()
-        r = R * np.sqrt(u)
-        theta = 2 * np.pi * v
-        z = z0 + H * w
-        x = r * np.cos(theta)
-        y = r * np.sin(theta)
-        point = np.array([x, y, z])
-        tree, coarse_coords, coarse_fields = self.coarse_data[id_]
-        patch = find_coarse_patch(tree, coarse_coords, coarse_fields, point, self.n_neighbors)
-        shape = np.array([r_um, h_um])
-        if self.normalize:
-            point = (point - self.coords_mean) / self.coords_std
-            shape = (shape - self.shape_mean) / self.shape_std
-            n_fields_flat = self.n_neighbors * 8
-            patch_fields = patch[:n_fields_flat].reshape(self.n_neighbors, 8)
-            patch_rel = patch[n_fields_flat:].reshape(self.n_neighbors, 3)
-            patch_fields_norm = (patch_fields - self.fields_mean) / self.fields_std
-            patch = np.concatenate([patch_fields_norm.ravel(), patch_rel.ravel()])
-        return {
-            'coords': torch.tensor(point, dtype=torch.float32),
-            'shape_params': torch.tensor(shape, dtype=torch.float32),
-            'coarse_patch': torch.tensor(patch, dtype=torch.float32),
-            'id': id_
-        }
+        """Обратная совместимость для DataLoader без поддержки __getitems__."""
+        return self.__getitems__([idx])[0]
 
 
 # ---------------------- Модель SR-PINN ----------------------
@@ -518,8 +599,8 @@ class SRPINN(nn.Module):
                  n_shape_params: int = 2,
                  n_coarse_nodes: int = 8,
                  n_field_vars: int = 8,
-                 hidden_dim: int = 256,  # увеличено для стабильности
-                 n_blocks: int = 6,  # увеличено
+                 hidden_dim: int = 256,
+                 n_blocks: int = 6,
                  fourier_mapping_size: int = 128,
                  fourier_scale: float = 5.0):
         super().__init__()
@@ -563,42 +644,40 @@ class StressPINNLoss(nn.Module):
 
     def forward(self, model, batch, batch_pde=None):
         device = next(model.parameters()).device
+
+        # Один forward для всего батча
+        coords = batch['coords']
+        shape = batch['shape_params']
+        patch = batch['coarse_patch']
+        pred_norm = model(coords, shape, patch)  # (N, 8)
+
         loss_data = torch.tensor(0.0, device=device)
-        loss_voltage = torch.tensor(0.0, device=device)
-
-        # 1. Полевая MSE (как раньше)
         if 'target' in batch:
-            pred = model(batch['coords'], batch['shape_params'], batch['coarse_patch'])
-            loss_data = self.mse(pred, batch['target'])
+            loss_data = self.mse(pred_norm, batch['target'])
 
-        # 2. Voltage loss – вычисляем V_pred из phi_pred на границах
+        loss_voltage = torch.tensor(0.0, device=device)
         if 'is_top' in batch and 'is_bottom' in batch and 'id' in batch:
-            with torch.no_grad():
-                # Денормализуем поля (нужно для phi)
-                fields_mean = batch['fields_mean']
-                fields_std = batch['fields_std']
-            # Предсказание модели (нормализованное)
-            pred_norm = model(batch['coords'], batch['shape_params'], batch['coarse_patch'])
+            fields_mean = batch['fields_mean']
+            fields_std = batch['fields_std']
             # Денормализуем phi (индексы 6,7)
             phi_real = pred_norm[:, 6] * fields_std[..., 6] + fields_mean[..., 6]
             phi_imag = pred_norm[:, 7] * fields_std[..., 7] + fields_mean[..., 7]
             phi = torch.complex(phi_real, phi_imag)
 
-            # Для каждого уникального ID в батче
-            unique_ids = torch.unique(batch['id'])
+            ids = batch['id']
+            is_top = batch['is_top']
+            is_bottom = batch['is_bottom']
+            unique_ids = torch.unique(ids)
             for uid in unique_ids:
-                mask_id = (batch['id'] == uid)
-                mask_top = mask_id & batch['is_top']
-                mask_bottom = mask_id & batch['is_bottom']
-                if mask_top.any() and mask_bottom.any():
-                    phi_top = phi[mask_top].mean()
-                    phi_bottom = phi[mask_bottom].mean()
+                mask = (ids == uid)
+                top_mask = mask & is_top
+                bottom_mask = mask & is_bottom
+                if top_mask.any() and bottom_mask.any():
+                    phi_top = phi[top_mask].mean()
+                    phi_bottom = phi[bottom_mask].mean()
                     V_pred = phi_top - phi_bottom
-                    # Истинное напряжение из CSV (нужно передать в батч)
-                    # Для этого добавим в датасет поле 'voltage_true'
-                    #V_true = batch['voltage_true'][mask_id][0]  # предполагаем, что оно одинаково для всех точек ID
-                    V_true = batch['voltage_true'][mask_id].mean()
-                    loss_voltage += self.mse(V_pred.abs(), V_true)  # или комплексная разница
+                    V_true = batch['voltage_true'][mask].mean()  # или .mean(), так как одинаково
+                    loss_voltage += self.mse(V_pred.abs(), V_true)
 
         total_loss = self.lambda_data * loss_data + self.lambda_voltage * loss_voltage
         return total_loss, {
@@ -807,28 +886,33 @@ def train_srpinn(model, train_loader, val_dataset, colloc_loader, n_epochs, devi
     colloc_iter = iter(colloc_loader)
     step_counter = 0
 
+    # Создаём val_loader один раз
+    val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False)
+
+    # Ключи, которые нужно переносить на device для train и val
+    train_keys = {'coords', 'shape_params', 'coarse_patch', 'target',
+                  'voltage_true', 'is_bottom', 'is_top', 'fields_mean', 'fields_std', 'id'}
+    colloc_keys = {'coords', 'shape_params', 'coarse_patch'}
+
     for epoch in range(n_epochs):
         model.train()
         train_losses = []
+
         for batch in train_loader:
             compute_pde = (step_counter % pde_every == 0)
             step_counter += 1
+
             if compute_pde:
                 try:
                     batch_pde = next(colloc_iter)
                 except StopIteration:
                     colloc_iter = iter(colloc_loader)
                     batch_pde = next(colloc_iter)
-                for k in ['coords', 'shape_params', 'coarse_patch']:
-                    if k in batch_pde:
-                        batch_pde[k] = batch_pde[k].to(device)
+                batch_pde = to_device(batch_pde, device)
             else:
                 batch_pde = None
 
-            for k in ['coords', 'shape_params', 'coarse_patch', 'target',
-                      'voltage_true', 'is_bottom', 'is_top', 'fields_mean', 'fields_std', 'id']:
-                if k in batch:
-                    batch[k] = batch[k].to(device)
+            batch = to_device(batch, device)
 
             optimizer.zero_grad()
             loss, loss_dict = criterion(model, batch, batch_pde)
@@ -839,20 +923,16 @@ def train_srpinn(model, train_loader, val_dataset, colloc_loader, n_epochs, devi
 
         scheduler.step()
 
+        # Валидация (не каждую эпоху)
         if epoch % 10 == 0 or epoch == n_epochs - 1:
             model.eval()
+            val_losses = []
             with torch.no_grad():
-                val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False)
-                val_losses = []
                 for vbatch in val_loader:
-                    # Перенос всех полей для валидации
-                    for k in ['coords', 'shape_params', 'coarse_patch', 'target',
-                              'voltage_true', 'is_bottom', 'is_top', 'fields_mean', 'fields_std', 'id']:
-                        if k in vbatch:
-                            vbatch[k] = vbatch[k].to(device)
+                    vbatch = to_device(vbatch, device)
                     _, loss_dict = criterion(model, vbatch, None)
                     val_losses.append(loss_dict)
-                avg_val_loss = np.mean([d['total_loss'] for d in val_losses])
+            avg_val_loss = np.mean([d['total_loss'] for d in val_losses])
 
             voltage_error = compute_voltage_error(model, val_dataset, device, verbose=True)
             avg_train_loss = np.mean([d['total_loss'] for d in train_losses])
@@ -935,28 +1015,19 @@ if __name__ == "__main__":
     coarse_coords_dict = {}
     coarse_fields_dict = {}
     for id_ in test_ids:
-        fname = os.path.join(data_dir, f'pinndata_quick_id_{id_:04d}_coarse.mat')
-        if os.path.exists(fname):
-            with h5py.File(fname, 'r') as f:
-                X = f['X'][:]
-                Y = f['Y'][:]
-                Z = f['Z'][:]
-                ux = load_complex_from_h5(f, 'ux')
-                uy = load_complex_from_h5(f, 'uy')
-                uz = load_complex_from_h5(f, 'uz')
-                phi = load_complex_from_h5(f, 'phi')
-            coords = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
-            fields = np.stack([ux.real.ravel(), ux.imag.ravel(),
-                               uy.real.ravel(), uy.imag.ravel(),
-                               uz.real.ravel(), uz.imag.ravel(),
-                               phi.real.ravel(), phi.imag.ravel()], axis=1)
+        try:
+            coords, fields = load_mat_with_cache(id_, "coarse", data_dir)
             coarse_coords_dict[id_] = coords
             coarse_fields_dict[id_] = fields
+        except FileNotFoundError:
+            print(f"Warning: coarse file for ID {id_} not found, skipping")
+            continue
 
-    test_coarse_coords = [coarse_coords_dict[id_] for id_ in test_ids if id_ in coarse_coords_dict]
-    test_coarse_fields = [coarse_fields_dict[id_] for id_ in test_ids if id_ in coarse_coords_dict]
-    test_coarse_ids = [id_ for id_ in test_ids if id_ in coarse_coords_dict]
-    test_dataset.set_coarse_data(test_coarse_coords, test_coarse_fields, test_coarse_ids)
+    filtered = [(id_, coarse_coords_dict[id_], coarse_fields_dict[id_])
+                for id_ in test_ids if id_ in coarse_coords_dict]
+    if filtered:
+        test_coarse_ids, test_coarse_coords, test_coarse_fields = zip(*filtered)
+        test_dataset.set_coarse_data(list(test_coarse_coords), list(test_coarse_fields), list(test_coarse_ids))
 
     # DataLoader'ы
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
@@ -964,6 +1035,7 @@ if __name__ == "__main__":
 
     # Модель
     model = SRPINN()
+    model = torch.compile(model)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
