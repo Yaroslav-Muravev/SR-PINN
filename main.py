@@ -76,6 +76,78 @@ def load_all_csv_cached(data_dir: str, pattern: str, cache_name: str) -> pd.Data
     df.to_parquet(cache_file)
     return df
 
+
+import numpy as np
+from typing import Iterable, Tuple, Optional
+
+def compute_stats_incremental(
+    arrays: Iterable[np.ndarray],
+    epsilon: float = 1e-20,
+    dtype: np.dtype = np.float64
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Вычисляет среднее и стандартное отклонение (population) по наборам строк,
+    объединяя все массивы по вертикали, но без физического копирования данных.
+
+    Параметры
+    ----------
+    arrays : Iterable[np.ndarray]
+        Итератор или список массивов. Каждый массив имеет форму (n_i, d).
+        Размерность d определяется по первому непустому массиву.
+    epsilon : float
+        Нижняя граница для стандартного отклонения (чтобы избежать деления на ноль).
+    dtype : np.dtype
+        Тип данных для накопления сумм (по умолчанию float64).
+
+    Возвращает
+    ----------
+    mean : np.ndarray
+        Вектор средних значений для каждого из d столбцов.
+    std : np.ndarray
+        Вектор стандартных отклонений (pop) с обрезанием по epsilon.
+    """
+    n_total = 0
+    sum_ = None
+    sum_sq = None
+
+    for arr in arrays:
+        if arr.shape[0] == 0:
+            continue
+        if sum_ is None:
+            d = arr.shape[1]
+            sum_ = np.zeros(d, dtype=dtype)
+            sum_sq = np.zeros(d, dtype=dtype)
+
+        n_total += arr.shape[0]
+        sum_ += arr.sum(axis=0, dtype=dtype)
+        sum_sq += (arr.astype(dtype) ** 2).sum(axis=0)
+
+    if n_total == 0:
+        if sum_ is None:
+            dim = 8
+            mean = np.zeros(dim)
+            std = np.ones(dim) * epsilon
+        else:
+            mean = np.zeros_like(sum_)
+            std = np.ones_like(sum_) * epsilon
+        return mean, std
+
+    mean = sum_ / n_total
+    variance = sum_sq / n_total - mean * mean
+    variance = np.maximum(variance, 0.0)   # отсечь малые отрицательные из-за погрешностей
+    std = np.sqrt(variance)
+    std = np.maximum(std, epsilon)
+    return mean, std
+
+def generate_fine_fields(train_ids, data_dir):
+    """Генератор, выдающий fields для каждого существующего fine-файла."""
+    for id_ in train_ids:
+        fname = os.path.join(data_dir, f'pinndata_quick_id_{id_:04d}_fine.mat')
+        if not os.path.exists(fname):
+            continue
+        _, fields = load_mat_with_cache(id_, "fine", data_dir)
+        yield fields
+
 # ---------------------- Вспомогательные функции ----------------------
 
 def parse_complex(s):
@@ -198,9 +270,7 @@ class CylinderStressDataset(Dataset):
 
         # Нормализация
         if normalize and self.total_points > 0:
-            all_coords = np.vstack(self.coords_list)
-            self.coords_mean = all_coords.mean(axis=0)
-            self.coords_std = np.maximum(all_coords.std(axis=0), 1e-8)
+            self.coords_mean, self.coords_std = compute_stats_incremental(self.coords_list, epsilon=1e-8)
 
             all_shape = np.array(self.shape_params)
             self.shape_mean = all_shape.mean(axis=0)
@@ -208,7 +278,7 @@ class CylinderStressDataset(Dataset):
 
             if external_stats is not None:
                 fields_mean_np, fields_std_np = external_stats
-                # Преобразование один раз (если пришли тензоры)
+
                 if torch.is_tensor(fields_mean_np):
                     fields_mean_np = fields_mean_np.cpu().numpy()
                 if torch.is_tensor(fields_std_np):
@@ -217,10 +287,7 @@ class CylinderStressDataset(Dataset):
                 self.fields_std_np = fields_std_np
                 print(f"Using external fields stats: mean[6]={self.fields_mean_np[6]:.3e}, std[6]={self.fields_std_np[6]:.3e}")
             else:
-                all_fields = np.vstack(self.fields_list)
-                self.fields_mean_np = all_fields.mean(axis=0)
-                self.fields_std_np = all_fields.std(axis=0)
-                self.fields_std_np = np.maximum(self.fields_std_np, 1e-20)
+                self.fields_mean_np, self.fields_std_np = compute_stats_incremental(self.fields_list, epsilon=1e-20)
                 print(f"Computed from fine: mean[6]={self.fields_mean_np[6]:.3e}, std[6]={self.fields_std_np[6]:.3e}")
 
             # Создаём тензоры для быстрого доступа в __getitem__
@@ -254,7 +321,7 @@ class CylinderStressDataset(Dataset):
         self._precompute_patches()
 
     def _precompute_patches(self):
-        """Вычисляет и сохраняет патчи для всех точек всех ID (один раз)."""
+        """Вычисляет и сохраняет патчи для всех точек всех ID (один раз) — ускоренная версия."""
         if self.coarse_trees is None:
             self.precomputed_patches = None
             return
@@ -263,25 +330,49 @@ class CylinderStressDataset(Dataset):
         for id_idx, coords in enumerate(self.coords_list):
             id_ = int(self.df.iloc[id_idx]['id'])
             if id_ not in self.coarse_trees:
-                patches = [np.zeros(self.n_neighbors * (8 + 3)) for _ in range(coords.shape[0])]
+                # Нет coarse-данных: создаём нулевые патчи
+                patches = np.zeros((coords.shape[0], self.n_neighbors * (8 + 3)), dtype=np.float32)
                 self.precomputed_patches.append(patches)
                 continue
 
             tree = self.coarse_trees[id_]
             coarse_coords = self.coarse_coords[id_]
             coarse_fields = self.coarse_fields[id_]
-            patches = []
-            for point in coords:
-                patch = find_coarse_patch(tree, coarse_coords, coarse_fields, point, self.n_neighbors)
-                if self.normalize:
-                    n_fields_flat = self.n_neighbors * 8
-                    patch_fields = patch[:n_fields_flat].reshape(self.n_neighbors, 8)
-                    patch_rel = patch[n_fields_flat:].reshape(self.n_neighbors, 3)
-                    # Используем numpy-версии полей
-                    patch_fields_norm = (patch_fields - self.fields_mean_np) / (self.fields_std_np + 1e-20)
-                    patch = np.concatenate([patch_fields_norm.ravel(), patch_rel.ravel()])
-                patches.append(patch)
-            self.precomputed_patches.append(patches)
+
+            # 1. Batch-запрос всех точек за один вызов
+            dists, idxs = tree.query(coords, k=self.n_neighbors)  # (N, k), (N, k)
+
+            # 2. Получаем координаты и поля соседей для всех точек
+            neighbour_coords = coarse_coords[idxs]  # (N, k, 3)
+            neighbour_fields = coarse_fields[idxs]  # (N, k, 8)
+
+            # 3. Масштаб: среднее расстояние для каждой точки
+            scale = np.mean(dists, axis=1, keepdims=True) + 1e-8  # (N, 1)
+
+            # 4. Относительные координаты
+            rel_coords = (neighbour_coords - coords[:, np.newaxis, :]) / scale[..., np.newaxis]  # (N, k, 3)
+
+            # 5. Формируем сырой патч (поля + относительные координаты)
+            fields_flat = neighbour_fields.reshape(coords.shape[0], -1)  # (N, k*8)
+            rel_flat = rel_coords.reshape(coords.shape[0], -1)  # (N, k*3)
+            patch = np.concatenate([fields_flat, rel_flat], axis=1)  # (N, k*(8+3))
+
+            # 6. Нормализация полей (если включена)
+            if self.normalize:
+                n_fields_flat = self.n_neighbors * 8
+                # Разделяем поля и относительные координаты для нормализации
+                patch_fields = patch[:, :n_fields_flat].reshape(coords.shape[0], self.n_neighbors, 8)
+                patch_rel = patch[:, n_fields_flat:].reshape(coords.shape[0], self.n_neighbors, 3)
+                # Нормализуем поля, используя self.fields_mean_np и self.fields_std_np
+                patch_fields_norm = (patch_fields - self.fields_mean_np) / (self.fields_std_np + 1e-20)
+                # Склеиваем обратно
+                patch = np.concatenate([
+                    patch_fields_norm.reshape(coords.shape[0], -1),
+                    patch_rel.reshape(coords.shape[0], -1)
+                ], axis=1)
+
+            # Сохраняем как двумерный массив (N, patch_dim) — __getitem__ будет работать без изменений
+            self.precomputed_patches.append(patch)
 
     def get_id_slice(self, id_: int) -> slice:
         idx = self.id_to_index.get(id_)
@@ -527,6 +618,7 @@ def prepare_datasets(data_dir: str,
     - Статистика mean/std для полей считается ТОЛЬКО по fine-данным (target)
     - Coarse-данные используются только для patch (не для статистики)
     """
+
     fine_df = load_all_csv_cached(data_dir, 'results_fine', 'fine_df')
     coarse_df = load_all_csv_cached(data_dir, 'results_coarse', 'coarse_df')
 
@@ -534,25 +626,10 @@ def prepare_datasets(data_dir: str,
         raise ValueError("Не найдены results_fine*.csv")
 
     # === 1. Статистика полей — ТОЛЬКО ПО FINE-ДАННЫМ (целевая правда) ===
-    all_fine_fields = []
-    for id_ in train_ids:  # только train, чтобы не было утечки
-        fname = os.path.join(data_dir, f'pinndata_quick_id_{id_:04d}_fine.mat')
-        if not os.path.exists(fname):
-            continue
+    fields_mean, fields_std = compute_stats_incremental(generate_fine_fields(train_ids, data_dir))
 
-        _, fields = load_mat_with_cache(id_, "fine", data_dir)
-        all_fine_fields.append(fields)
-
-    if all_fine_fields:
-        all_fields_stack = np.vstack(all_fine_fields)
-        fields_mean = all_fields_stack.mean(axis=0)
-        fields_std = all_fields_stack.std(axis=0)
-        fields_std = np.maximum(fields_std, 1e-20)
-        print(f"Fields stats FROM FINE data: mean[6]={fields_mean[6]:.3e}, "
-              f"std[6]={fields_std[6]:.3e} | mean[7]={fields_mean[7]:.3e}, std[7]={fields_std[7]:.3e}")
-    else:
-        fields_mean = np.zeros(8)
-        fields_std = np.ones(8)
+    print(f"Fields stats FROM FINE data: mean[6]={fields_mean[6]:.3e}, "
+          f"std[6]={fields_std[6]:.3e} | mean[7]={fields_mean[7]:.3e}, std[7]={fields_std[7]:.3e}")
 
     external_stats = (fields_mean, fields_std)
 
@@ -609,25 +686,31 @@ def prepare_datasets(data_dir: str,
     set_coarse(val_dataset, val_ids)
 
     # === 4. Collocation dataset (только для train) ===
+
+    # Строим словари для быстрого доступа
+    coarse_shape_dict = {
+        row['id']: (row['r_um'], row['h_um'])
+        for _, row in coarse_df.iterrows()
+    }
+    coarse_id_to_index = {id_: idx for idx, id_ in enumerate(coarse_id_list)}
+
+    # Кэш деревьев (строим один раз)
+    coarse_trees_cache = {}
+    for idx, id_ in enumerate(coarse_id_list):
+        # build_kdtree – ваша функция, обёртка над cKDTree
+        coarse_trees_cache[id_] = build_kdtree(coarse_coords_list[idx])
+
+    # Создаём colloc_dataset без повторного построения
     colloc_ids = [id_ for id_ in train_ids if id_ in needed_ids]
     coarse_data_colloc = {}
     shape_params_colloc = {}
 
-    # Словарь shape_params из coarse CSV
-    coarse_shape_dict = {}
-    for id_ in needed_ids:
-        row = coarse_df[coarse_df['id'] == id_]
-        if not row.empty:
-            coarse_shape_dict[id_] = (row.iloc[0]['r_um'], row.iloc[0]['h_um'])
-
     for id_ in colloc_ids:
-        try:
-            idx = coarse_id_list.index(id_)
-        except ValueError:
+        idx = coarse_id_to_index.get(id_)
+        if idx is None:
             continue
-        tree = build_kdtree(coarse_coords_list[idx])
         coarse_data_colloc[id_] = (
-            tree,
+            coarse_trees_cache[id_],
             coarse_coords_list[idx],
             coarse_fields_list[idx]
         )
@@ -906,4 +989,5 @@ if __name__ == "__main__":
         'fields_mean': stats['fields_mean'],
         'fields_std': stats['fields_std']
     }, 'best_srpinn_model_with_stats.pth')
+
     print("Модель сохранена: best_srpinn_model_with_stats.pth")
