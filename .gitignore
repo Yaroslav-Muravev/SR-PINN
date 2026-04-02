@@ -1,5 +1,6 @@
 files/
 cache/
+pytorch_cache/
 .idea/
 __pycache__/
 *.zip

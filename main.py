@@ -77,19 +77,29 @@ def load_all_csv_cached(data_dir: str, pattern: str, cache_name: str) -> pd.Data
     return df
 
 # ---------------------- Вспомогательные функции ----------------------
-def parse_complex(s: str) -> complex:
-    s = s.strip().replace(' ', '')
-    pattern = r'^([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)?([-+]\d*\.?\d+(?:[eE][-+]?\d+)?)i$'
-    m = re.match(pattern, s)
-    if m:
-        re_part = float(m.group(1)) if m.group(1) else 0.0
-        im_part = float(m.group(2))
-        return complex(re_part, im_part)
-    else:
-        try:
-            return complex(s)
-        except:
-            return complex(np.nan, np.nan)
+
+def parse_complex(s):
+    # Handle numeric inputs directly
+    if isinstance(s, (int, float)):
+        return complex(s, 0)   # treat as real number
+    if isinstance(s, str):
+        s = s.strip().replace(' ', '')
+        pattern = r'^([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)?([-+]\d*\.?\d+(?:[eE][-+]?\d+)?)i$'
+        m = re.match(pattern, s)
+        if m:
+            re_part = float(m.group(1)) if m.group(1) else 0.0
+            im_part = float(m.group(2))
+            return complex(re_part, im_part)
+        else:
+            try:
+                return complex(s)   # e.g., "1.2" -> 1.2+0j
+            except:
+                return complex(np.nan, np.nan)
+    # Fallback for any other type
+    try:
+        return complex(s)
+    except:
+        return complex(np.nan, np.nan)
 
 
 def load_complex_from_h5(f, key: str) -> np.ndarray:
@@ -126,12 +136,10 @@ def load_all_csv(data_dir: str, pattern: str) -> pd.DataFrame:
 
 # ---------------------- Датасеты (без изменений) ----------------------
 class CylinderStressDataset(Dataset):
-    # ... (оставлен полностью как в предыдущей версии, только __getitem__ и __init__ без изменений)
     def __init__(self, data_dir: str, csv_df: pd.DataFrame, ids: List[int], mesh_type: str,
                  n_neighbors: int = 8, normalize: bool = True,
                  external_stats: Optional[Tuple[np.ndarray, np.ndarray]] = None,
                  subsample_ratio: float = 1.0):
-        # ... (тот же код, что был в предыдущей версии)
         self.data_dir = data_dir
         self.n_neighbors = n_neighbors
         self.normalize = normalize
@@ -162,9 +170,9 @@ class CylinderStressDataset(Dataset):
             coords, fields = load_mat_with_cache(id_, mesh_type, self.data_dir)
 
             z_vals = coords[:, 2]
-            z_min = z_vals.min();
+            z_min = z_vals.min()
             z_max = z_vals.max()
-            self.z_min_list.append(z_min);
+            self.z_min_list.append(z_min)
             self.z_max_list.append(z_max)
             eps_z = 1e-6 * (z_max - z_min)
             bottom_mask = np.abs(z_vals - z_min) < eps_z
@@ -199,27 +207,39 @@ class CylinderStressDataset(Dataset):
             self.shape_std = np.maximum(all_shape.std(axis=0), 1e-8)
 
             if external_stats is not None:
-                self.fields_mean, self.fields_std = external_stats
-                print(
-                    f"Using external fields stats: mean[6]={self.fields_mean[6]:.3e}, std[6]={self.fields_std[6]:.3e}")
+                fields_mean_np, fields_std_np = external_stats
+                # Преобразование один раз (если пришли тензоры)
+                if torch.is_tensor(fields_mean_np):
+                    fields_mean_np = fields_mean_np.cpu().numpy()
+                if torch.is_tensor(fields_std_np):
+                    fields_std_np = fields_std_np.cpu().numpy()
+                self.fields_mean_np = fields_mean_np
+                self.fields_std_np = fields_std_np
+                print(f"Using external fields stats: mean[6]={self.fields_mean_np[6]:.3e}, std[6]={self.fields_std_np[6]:.3e}")
             else:
                 all_fields = np.vstack(self.fields_list)
-                self.fields_mean = all_fields.mean(axis=0)
-                self.fields_std = all_fields.std(axis=0)
-                self.fields_std = np.maximum(self.fields_std, 1e-20)  # мягкий clamp
-                print(f"Computed from fine: mean[6]={self.fields_mean[6]:.3e}, std[6]={self.fields_std[6]:.3e}")
+                self.fields_mean_np = all_fields.mean(axis=0)
+                self.fields_std_np = all_fields.std(axis=0)
+                self.fields_std_np = np.maximum(self.fields_std_np, 1e-20)
+                print(f"Computed from fine: mean[6]={self.fields_mean_np[6]:.3e}, std[6]={self.fields_std_np[6]:.3e}")
+
+            # Создаём тензоры для быстрого доступа в __getitem__
+            self.fields_mean_tensor = torch.from_numpy(self.fields_mean_np).float()
+            self.fields_std_tensor = torch.from_numpy(self.fields_std_np).float()
         else:
-            # fallback
-            self.coords_mean = np.zeros(3);
+            self.coords_mean = np.zeros(3)
             self.coords_std = np.ones(3)
-            self.shape_mean = np.zeros(2);
+            self.shape_mean = np.zeros(2)
             self.shape_std = np.ones(2)
-            self.fields_mean = np.zeros(8);
-            self.fields_std = np.ones(8)
+            self.fields_mean_np = np.zeros(8)
+            self.fields_std_np = np.ones(8)
+            self.fields_mean_tensor = torch.zeros(8, dtype=torch.float32)
+            self.fields_std_tensor = torch.ones(8, dtype=torch.float32)
 
         self.coarse_trees = None
         self.coarse_coords = None
         self.coarse_fields = None
+        self.precomputed_patches = None
 
     def set_coarse_data(self, coarse_coords_list, coarse_fields_list, coarse_ids):
         self.coarse_trees = {}
@@ -230,6 +250,38 @@ class CylinderStressDataset(Dataset):
                 self.coarse_trees[id_] = build_kdtree(coarse_coords_list[idx])
                 self.coarse_coords[id_] = coarse_coords_list[idx]
                 self.coarse_fields[id_] = coarse_fields_list[idx]
+
+        self._precompute_patches()
+
+    def _precompute_patches(self):
+        """Вычисляет и сохраняет патчи для всех точек всех ID (один раз)."""
+        if self.coarse_trees is None:
+            self.precomputed_patches = None
+            return
+
+        self.precomputed_patches = []
+        for id_idx, coords in enumerate(self.coords_list):
+            id_ = int(self.df.iloc[id_idx]['id'])
+            if id_ not in self.coarse_trees:
+                patches = [np.zeros(self.n_neighbors * (8 + 3)) for _ in range(coords.shape[0])]
+                self.precomputed_patches.append(patches)
+                continue
+
+            tree = self.coarse_trees[id_]
+            coarse_coords = self.coarse_coords[id_]
+            coarse_fields = self.coarse_fields[id_]
+            patches = []
+            for point in coords:
+                patch = find_coarse_patch(tree, coarse_coords, coarse_fields, point, self.n_neighbors)
+                if self.normalize:
+                    n_fields_flat = self.n_neighbors * 8
+                    patch_fields = patch[:n_fields_flat].reshape(self.n_neighbors, 8)
+                    patch_rel = patch[n_fields_flat:].reshape(self.n_neighbors, 3)
+                    # Используем numpy-версии полей
+                    patch_fields_norm = (patch_fields - self.fields_mean_np) / (self.fields_std_np + 1e-20)
+                    patch = np.concatenate([patch_fields_norm.ravel(), patch_rel.ravel()])
+                patches.append(patch)
+            self.precomputed_patches.append(patches)
 
     def get_id_slice(self, id_: int) -> slice:
         idx = self.id_to_index.get(id_)
@@ -250,19 +302,16 @@ class CylinderStressDataset(Dataset):
         fields = self.fields_list[id_idx][local_idx]
         shape = np.array(self.shape_params[id_idx])
 
-        patch = np.zeros(self.n_neighbors * (8 + 3))
-        if self.coarse_trees is not None and id_ in self.coarse_trees:
-            patch = find_coarse_patch(self.coarse_trees[id_], self.coarse_coords[id_],
-                                      self.coarse_fields[id_], coords, self.n_neighbors)
+        if self.precomputed_patches is not None:
+            patch = self.precomputed_patches[id_idx][local_idx]
+        else:
+            patch = np.zeros(self.n_neighbors * (8 + 3))
 
         if self.normalize:
             coords = (coords - self.coords_mean) / self.coords_std
             shape = (shape - self.shape_mean) / self.shape_std
-            n_fields_flat = self.n_neighbors * 8
-            patch_fields = patch[:n_fields_flat].reshape(self.n_neighbors, 8)
-            patch_rel = patch[n_fields_flat:].reshape(self.n_neighbors, 3)
-            patch_fields_norm = (patch_fields - self.fields_mean) / (self.fields_std + 1e-20)
-            patch = np.concatenate([patch_fields_norm.ravel(), patch_rel.ravel()])
+
+        voltage_true = self.df[self.df['id'] == id_].iloc[0]['voltage_complex']
 
         return {
             'coords': torch.tensor(coords, dtype=torch.float32),
@@ -270,8 +319,11 @@ class CylinderStressDataset(Dataset):
             'coarse_patch': torch.tensor(patch, dtype=torch.float32),
             'target': torch.tensor(fields, dtype=torch.float32),
             'id': id_,
-            'fields_mean': torch.tensor(self.fields_mean, dtype=torch.float32),
-            'fields_std': torch.tensor(self.fields_std, dtype=torch.float32)
+            'fields_mean': self.fields_mean_tensor,   # готовый тензор
+            'fields_std': self.fields_std_tensor,     # готовый тензор
+            'is_bottom': torch.tensor(self.bottom_mask_list[id_idx][local_idx].item(), dtype=torch.bool),
+            'is_top': torch.tensor(self.top_mask_list[id_idx][local_idx].item(), dtype=torch.bool),
+            'voltage_true': torch.tensor(abs(voltage_true), dtype=torch.float32)
         }
 
 
@@ -411,28 +463,56 @@ class SRPINN(nn.Module):
         return out
 
 
-# ---------------------- Функция потерь (с PINN-регуляризацией + voltage supervision) ----------------------
-# ---------------------- Функция потерь (финальная версия) ----------------------
 class StressPINNLoss(nn.Module):
-    def __init__(self, lambda_data: float = 1.0):
+    def __init__(self, lambda_data: float = 1.0, lambda_voltage: float = 10.0):
         super().__init__()
         self.lambda_data = lambda_data
+        self.lambda_voltage = lambda_voltage
         self.mse = nn.MSELoss()
 
     def forward(self, model, batch, batch_pde=None):
         device = next(model.parameters()).device
         loss_data = torch.tensor(0.0, device=device)
+        loss_voltage = torch.tensor(0.0, device=device)
 
+        # 1. Полевая MSE (как раньше)
         if 'target' in batch:
             pred = model(batch['coords'], batch['shape_params'], batch['coarse_patch'])
             loss_data = self.mse(pred, batch['target'])
 
-        # NO voltage term here (it was broken)
-        # NO PDE term here (it was harmful)
+        # 2. Voltage loss – вычисляем V_pred из phi_pred на границах
+        if 'is_top' in batch and 'is_bottom' in batch and 'id' in batch:
+            with torch.no_grad():
+                # Денормализуем поля (нужно для phi)
+                fields_mean = batch['fields_mean']
+                fields_std = batch['fields_std']
+            # Предсказание модели (нормализованное)
+            pred_norm = model(batch['coords'], batch['shape_params'], batch['coarse_patch'])
+            # Денормализуем phi (индексы 6,7)
+            phi_real = pred_norm[:, 6] * fields_std[..., 6] + fields_mean[..., 6]
+            phi_imag = pred_norm[:, 7] * fields_std[..., 7] + fields_mean[..., 7]
+            phi = torch.complex(phi_real, phi_imag)
 
-        total_loss = self.lambda_data * loss_data
+            # Для каждого уникального ID в батче
+            unique_ids = torch.unique(batch['id'])
+            for uid in unique_ids:
+                mask_id = (batch['id'] == uid)
+                mask_top = mask_id & batch['is_top']
+                mask_bottom = mask_id & batch['is_bottom']
+                if mask_top.any() and mask_bottom.any():
+                    phi_top = phi[mask_top].mean()
+                    phi_bottom = phi[mask_bottom].mean()
+                    V_pred = phi_top - phi_bottom
+                    # Истинное напряжение из CSV (нужно передать в батч)
+                    # Для этого добавим в датасет поле 'voltage_true'
+                    #V_true = batch['voltage_true'][mask_id][0]  # предполагаем, что оно одинаково для всех точек ID
+                    V_true = batch['voltage_true'][mask_id].mean()
+                    loss_voltage += self.mse(V_pred.abs(), V_true)  # или комплексная разница
+
+        total_loss = self.lambda_data * loss_data + self.lambda_voltage * loss_voltage
         return total_loss, {
             'loss_data': loss_data.item(),
+            'loss_voltage': loss_voltage.item(),
             'total_loss': total_loss.item()
         }
 
@@ -580,7 +660,7 @@ def prepare_datasets(data_dir: str,
 
 
 # ---------------------- Вычисление ошибки напряжения ----------------------
-def compute_voltage_error(model, val_dataset, device, verbose=False):
+def compute_voltage_error(model, val_dataset, device, verbose=False, return_list=False, eps=1e-20):
     model.eval()
     ids_val = val_dataset.df['id'].values if hasattr(val_dataset, 'df') else []
     errors = []
@@ -604,8 +684,8 @@ def compute_voltage_error(model, val_dataset, device, verbose=False):
             shape = torch.cat(batch_shape, dim=0).to(device)
             patch = torch.cat(batch_patch, dim=0).to(device)
             pred_fields = model(coords, shape, patch).cpu().numpy()
-            fields_mean = val_dataset.fields_mean
-            fields_std = val_dataset.fields_std
+            fields_mean = val_dataset.fields_mean_np
+            fields_std = val_dataset.fields_std_np
             pred_fields_denorm = pred_fields * fields_std + fields_mean
             phi_pred = pred_fields_denorm[:, 6] + 1j * pred_fields_denorm[:, 7]
             id_idx = val_dataset.id_to_index[id_]
@@ -618,22 +698,28 @@ def compute_voltage_error(model, val_dataset, device, verbose=False):
             V_pred = phi_top - phi_bottom
             row = val_dataset.df[val_dataset.df['id'] == id_].iloc[0]
             V_true = row['voltage_complex']
-            error = abs(V_pred - V_true) / (abs(V_true) + 1e-15)
+            # Логарифмическая ошибка для модуля напряжения
+            abs_pred = abs(V_pred)
+            abs_true = abs(V_true)
+            # Добавляем eps, чтобы избежать log(0)
+            #log_pred = np.log10(abs_pred + eps)
+            #log_true = np.log10(abs_true + eps)
+            #error = abs(log_pred - log_true)   # ошибка в декадах
+            error = abs(V_pred - V_true) / abs_true
             errors.append(error)
             if verbose:
-                print(f"ID {id_}: bottom_mask sum={bottom_mask.sum()}, top_mask sum={top_mask.sum()}")
-                print(f"  phi_bottom mean = {phi_bottom:.3e}, phi_top mean = {phi_top:.3e}")
-                print(f"  V_pred = {V_pred:.3e}, V_true = {V_true:.3e}")
+                print(f"ID {id_}: V_pred = {V_pred:.3e}, V_true = {V_true:.3e}")
+                #print(f"  phi_top = {p:.3f}, phi_bottom = {abs_true:.3f}")
                 print(f"  relative error = {error:.4f}")
+    if return_list:
+        return np.array(errors)
     return np.mean(errors) if errors else float('inf')
-
 
 # ---------------------- Обучение ----------------------
 def train_srpinn(model, train_loader, val_dataset, colloc_loader, n_epochs, device, lr=5e-4, pde_every=5):
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
-    # criterion = StressPINNLoss(lambda_data=1.0, lambda_pde=0.05, lambda_voltage=15.0)
-    criterion = StressPINNLoss(lambda_data=1.0)
+    criterion = StressPINNLoss(lambda_data=1.0, lambda_voltage=10.0)
     best_voltage_error = float('inf')
     colloc_iter = iter(colloc_loader)
     step_counter = 0
@@ -651,11 +737,13 @@ def train_srpinn(model, train_loader, val_dataset, colloc_loader, n_epochs, devi
                     colloc_iter = iter(colloc_loader)
                     batch_pde = next(colloc_iter)
                 for k in ['coords', 'shape_params', 'coarse_patch']:
-                    batch_pde[k] = batch_pde[k].to(device)
+                    if k in batch_pde:
+                        batch_pde[k] = batch_pde[k].to(device)
             else:
                 batch_pde = None
 
-            for k in ['coords', 'shape_params', 'coarse_patch', 'target']:
+            for k in ['coords', 'shape_params', 'coarse_patch', 'target',
+                      'voltage_true', 'is_bottom', 'is_top', 'fields_mean', 'fields_std', 'id']:
                 if k in batch:
                     batch[k] = batch[k].to(device)
 
@@ -674,7 +762,9 @@ def train_srpinn(model, train_loader, val_dataset, colloc_loader, n_epochs, devi
                 val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False)
                 val_losses = []
                 for vbatch in val_loader:
-                    for k in ['coords', 'shape_params', 'coarse_patch', 'target']:
+                    # Перенос всех полей для валидации
+                    for k in ['coords', 'shape_params', 'coarse_patch', 'target',
+                              'voltage_true', 'is_bottom', 'is_top', 'fields_mean', 'fields_std', 'id']:
                         if k in vbatch:
                             vbatch[k] = vbatch[k].to(device)
                     _, loss_dict = criterion(model, vbatch, None)
@@ -691,7 +781,6 @@ def train_srpinn(model, train_loader, val_dataset, colloc_loader, n_epochs, devi
                 best_voltage_error = voltage_error
                 torch.save(model.state_dict(), 'best_srpinn_model_voltage.pth')
                 print(f"  >>> Saved best model (voltage error {best_voltage_error:.4f}) <<<")
-
 
 def parse_idx_train(data_dir: str) -> Tuple[List[int], List[int], List[int]]:
     """
@@ -803,9 +892,9 @@ if __name__ == "__main__":
     print("\n=== ОЦЕНКА НА ТЕСТОВЫХ ID ===")
     model.load_state_dict(torch.load('best_srpinn_model_voltage.pth', map_location=device))
     model.eval()
-    test_errors = compute_voltage_error(model, test_dataset, device, verbose=True)
-    print(f"Test mean voltage error : {np.mean(test_errors):.4f}")
-    print(f"Test median voltage error: {np.median(test_errors):.4f}")
+    test_errors = compute_voltage_error(model, test_dataset, device, verbose=True, return_list=True)
+    print(f"Test mean log error (decades): {np.mean(test_errors):.4f}")
+    print(f"Test median log error: {np.median(test_errors):.4f}")
 
     # Сохранение с статистиками
     torch.save({
