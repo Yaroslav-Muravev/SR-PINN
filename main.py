@@ -56,8 +56,8 @@ def load_mat_with_cache(id_: int, mesh_type: str, data_dir: str) -> tuple:
         ux.real.ravel(), ux.imag.ravel(),
         uy.real.ravel(), uy.imag.ravel(),
         uz.real.ravel(), uz.imag.ravel(),
-        phi.real.ravel(), phi.imag.ravel()
-    ], axis=1)
+        phi.real.ravel()
+    ], axis=1) # phi.imag.ravel() i deleted because of task proposition
 
     # Сохраняем в кэш
     np.savez_compressed(cache_file, coords=coords, fields=fields)
@@ -130,7 +130,7 @@ def compute_stats_incremental(
 
     if n_total == 0:
         if sum_ is None:
-            dim = 8
+            dim = 7
             mean = np.zeros(dim)
             std = np.ones(dim) * epsilon
         else:
@@ -269,6 +269,8 @@ class CylinderStressDataset(Dataset):
             self.total_points += coords.shape[0]
             self.cumulative_sizes.append(self.total_points)
 
+        self.n_field_vars = fields.shape[1]
+
         # Нормализация
         if normalize and self.total_points > 0:
             self.coords_mean, self.coords_std = compute_stats_incremental(self.coords_list, epsilon=1e-8)
@@ -299,10 +301,14 @@ class CylinderStressDataset(Dataset):
             self.coords_std = np.ones(3)
             self.shape_mean = np.zeros(2)
             self.shape_std = np.ones(2)
-            self.fields_mean_np = np.zeros(8)
-            self.fields_std_np = np.ones(8)
-            self.fields_mean_tensor = torch.zeros(8, dtype=torch.float32)
-            self.fields_std_tensor = torch.ones(8, dtype=torch.float32)
+            if self.total_points > 0:
+                dim = self.fields_list[0].shape[1]
+            else:
+                dim = 7
+            self.fields_mean_np = np.zeros(dim)
+            self.fields_std_np = np.ones(dim)
+            self.fields_mean_tensor = torch.zeros(dim, dtype=torch.float32)
+            self.fields_std_tensor = torch.ones(dim, dtype=torch.float32)
 
         self.coarse_trees = None
         self.coarse_coords = None
@@ -332,7 +338,7 @@ class CylinderStressDataset(Dataset):
             id_ = int(self.df.iloc[id_idx]['id'])
             if id_ not in self.coarse_trees:
                 # Нет coarse-данных: создаём нулевые патчи
-                patches = np.zeros((coords.shape[0], self.n_neighbors * (8 + 3)), dtype=np.float32)
+                patches = np.zeros((coords.shape[0], self.n_neighbors * (self.n_field_vars + 3)), dtype=np.float32)
                 self.precomputed_patches.append(patches)
                 continue
 
@@ -360,9 +366,9 @@ class CylinderStressDataset(Dataset):
 
             # 6. Нормализация полей (если включена)
             if self.normalize:
-                n_fields_flat = self.n_neighbors * 8
+                n_fields_flat = self.n_neighbors * self.n_field_vars
                 # Разделяем поля и относительные координаты для нормализации
-                patch_fields = patch[:, :n_fields_flat].reshape(coords.shape[0], self.n_neighbors, 8)
+                patch_fields = patch[:, :n_fields_flat].reshape(coords.shape[0], self.n_neighbors, self.n_field_vars)
                 patch_rel = patch[:, n_fields_flat:].reshape(coords.shape[0], self.n_neighbors, 3)
                 # Нормализуем поля, используя self.fields_mean_np и self.fields_std_np
                 patch_fields_norm = (patch_fields - self.fields_mean_np) / (self.fields_std_np + 1e-20)
@@ -397,11 +403,12 @@ class CylinderStressDataset(Dataset):
         if self.precomputed_patches is not None:
             patch = self.precomputed_patches[id_idx][local_idx]
         else:
-            patch = np.zeros(self.n_neighbors * (8 + 3))
+            patch = np.zeros(self.n_neighbors * (self.n_field_vars + 3))
 
         if self.normalize:
             coords = (coords - self.coords_mean) / self.coords_std
             shape = (shape - self.shape_mean) / self.shape_std
+            fields = (fields - self.fields_mean_np) / self.fields_std_np
 
         voltage_true = self.df[self.df['id'] == id_].iloc[0]['voltage_complex']
 
@@ -460,6 +467,8 @@ class CollocationDataset(Dataset):
                 'coarse_coords': coarse_coords,
                 'coarse_fields': coarse_fields
             }
+
+        self.n_field_vars = coarse_fields.shape[1]
 
     def __len__(self):
         return self.total_points
@@ -530,8 +539,8 @@ class CollocationDataset(Dataset):
             if self.normalize:
                 points_norm = (points - self.coords_mean) / self.coords_std
                 # Нормализация полей внутри патча
-                n_fields_flat = self.n_neighbors * 8
-                patch_fields = patches[:, :n_fields_flat].reshape(n_points, self.n_neighbors, 8)
+                n_fields_flat = self.n_neighbors * self.n_field_vars
+                patch_fields = patches[:, :n_fields_flat].reshape(n_points, self.n_neighbors, self.n_field_vars)
                 patch_rel = patches[:, n_fields_flat:].reshape(n_points, self.n_neighbors, 3)
                 patch_fields_norm = (patch_fields - self.fields_mean) / (self.fields_std + 1e-20)
                 patches = np.concatenate([
@@ -605,7 +614,7 @@ class SRPINN(nn.Module):
                  n_blocks: int = 6,
                  fourier_mapping_size: int = 128,
                  fourier_scale: float = 5.0,
-                 output_scale_init=100.0):
+                 output_scale_init=1000.0):
         super().__init__()
         self.n_coarse_nodes = n_coarse_nodes
         self.n_field_vars = n_field_vars
@@ -617,7 +626,8 @@ class SRPINN(nn.Module):
         self.input_proj = nn.Linear(fourier_dim + hidden_dim + hidden_dim, hidden_dim)
         self.blocks = nn.ModuleList([ResidualBlock(hidden_dim) for _ in range(n_blocks)])
         self.output_proj = nn.Linear(hidden_dim, n_field_vars)
-        self.output_scale = nn.Parameter(torch.tensor(output_scale_init, dtype=torch.float32))
+        self.output_scale = nn.Parameter(torch.ones(n_field_vars))
+        self.output_scale.data[6] = output_scale_init
         self._init_weights()
 
     def _init_weights(self):
@@ -641,11 +651,12 @@ class SRPINN(nn.Module):
 
 
 class StressPINNLoss(nn.Module):
-    def __init__(self, lambda_data: float = 1.0, lambda_voltage: float = 10.0):
+    def __init__(self, lambda_data: float = 1.0, lambda_voltage: float = 10.0, component_weights=None):
         super().__init__()
         self.lambda_data = lambda_data
         self.lambda_voltage = lambda_voltage
-        self.mse = nn.MSELoss()
+        self.mse = nn.MSELoss(reduction='none')  # поэлементная MSE
+        self.component_weights = component_weights
 
     def forward(self, model, batch, batch_pde=None):
         device = next(model.parameters()).device
@@ -658,7 +669,10 @@ class StressPINNLoss(nn.Module):
 
         loss_data = torch.tensor(0.0, device=device)
         if 'target' in batch:
-            loss_data = self.mse(pred_norm, batch['target'])
+            diff = (pred_norm - batch['target']) ** 2
+            if self.component_weights is not None:
+                diff = diff * self.component_weights.to(device)
+            loss_data = diff.mean()
 
         loss_voltage = torch.tensor(0.0, device=device)
         if 'is_top' in batch and 'is_bottom' in batch and 'id' in batch:
@@ -666,8 +680,8 @@ class StressPINNLoss(nn.Module):
             fields_std = batch['fields_std']
             # Денормализуем phi (индексы 6,7)
             phi_real = pred_norm[:, 6] * fields_std[..., 6] + fields_mean[..., 6]
-            phi_imag = pred_norm[:, 7] * fields_std[..., 7] + fields_mean[..., 7]
-            phi = torch.complex(phi_real, phi_imag)
+            #phi_imag = pred_norm[:, 7] * fields_std[..., 7] + fields_mean[..., 7]
+            phi = phi_real #torch.complex(phi_real, phi_imag)
 
             ids = batch['id']
             is_top = batch['is_top']
@@ -684,7 +698,7 @@ class StressPINNLoss(nn.Module):
                     V_true = batch['voltage_true'][mask].mean()  # или .mean(), так как одинаково
                     loss_voltage += self.mse(V_pred.abs(), V_true)
 
-        total_loss = self.lambda_data * loss_data + self.lambda_voltage * loss_voltage
+        total_loss = loss_data + self.lambda_voltage * loss_voltage
         return total_loss, {
             'loss_data': loss_data.item(),
             'loss_voltage': loss_voltage.item(),
@@ -712,8 +726,9 @@ def prepare_datasets(data_dir: str,
     # === 1. Статистика полей — ТОЛЬКО ПО FINE-ДАННЫМ (целевая правда) ===
     fields_mean, fields_std = compute_stats_incremental(generate_fine_fields(train_ids, data_dir))
 
-    print(f"Fields stats FROM FINE data: mean[6]={fields_mean[6]:.3e}, "
-          f"std[6]={fields_std[6]:.3e} | mean[7]={fields_mean[7]:.3e}, std[7]={fields_std[7]:.3e}")
+    print(f"Fields stats FROM FINE data (total {len(fields_mean)} components):")
+    for i in range(len(fields_mean)):
+        print(f"  mean[{i}]={fields_mean[i]:.3e}, std[{i}]={fields_std[i]:.3e}")
 
     external_stats = (fields_mean, fields_std)
 
@@ -854,7 +869,7 @@ def compute_voltage_error(model, val_dataset, device, verbose=False, return_list
             fields_mean = val_dataset.fields_mean_np
             fields_std = val_dataset.fields_std_np
             pred_fields_denorm = pred_fields * fields_std + fields_mean
-            phi_pred = pred_fields_denorm[:, 6] + 1j * pred_fields_denorm[:, 7]
+            phi_pred = pred_fields_denorm[:, 6] # + 1j * pred_fields_denorm[:, 7]
             id_idx = val_dataset.id_to_index[id_]
             bottom_mask = val_dataset.bottom_mask_list[id_idx]
             top_mask = val_dataset.top_mask_list[id_idx]
@@ -883,10 +898,10 @@ def compute_voltage_error(model, val_dataset, device, verbose=False, return_list
     return np.mean(errors) if errors else float('inf')
 
 # ---------------------- Обучение ----------------------
-def train_srpinn(model, train_loader, val_dataset, colloc_loader, n_epochs, device, lr=5e-4, pde_every=5):
+def train_srpinn(model, train_loader, val_dataset, colloc_loader, component_weights, n_epochs, device, lr=5e-4, pde_every=5):
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
-    criterion = StressPINNLoss(lambda_data=1.0, lambda_voltage=10.0)
+    criterion = StressPINNLoss(lambda_data=1.0, lambda_voltage=10.0, component_weights=component_weights)
     best_voltage_error = float('inf')
     colloc_iter = iter(colloc_loader)
     step_counter = 0
@@ -1039,13 +1054,21 @@ if __name__ == "__main__":
     colloc_loader = DataLoader(colloc_dataset, batch_size=64, shuffle=True)
 
     # Модель
-    model = SRPINN()
+    model = SRPINN(n_field_vars=7)
     model = torch.compile(model)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
+    component_weights = 1.0 / (train_dataset.fields_std_np ** 2)
+    component_weights = component_weights / component_weights.mean()  # нормировка
+    component_weights = torch.tensor(component_weights, dtype=torch.float32).to(device)
+    # Усиливаем phi (индекс 6) в 10–100 раз
+    component_weights[6] *= 1e4
+    # Ослабляем компоненту 5, если она доминирует
+    component_weights[5] *= 0.1
+
     # Обучение
-    train_srpinn(model, train_loader, val_dataset, colloc_loader,
+    train_srpinn(model, train_loader, val_dataset, colloc_loader, component_weights, 
                  n_epochs=300, device=device, lr=5e-4, pde_every=5)
 
     # Тест
