@@ -140,7 +140,7 @@ def compute_stats_incremental(
 
     mean = sum_ / n_total
     variance = sum_sq / n_total - mean * mean
-    variance = np.maximum(variance, 0.0)   # отсечь малые отрицательные из-за погрешностей
+    variance = np.maximum(variance, 0.0)
     std = np.sqrt(variance)
     std = np.maximum(std, epsilon)
     return mean, std
@@ -626,8 +626,8 @@ class SRPINN(nn.Module):
         self.input_proj = nn.Linear(fourier_dim + hidden_dim + hidden_dim, hidden_dim)
         self.blocks = nn.ModuleList([ResidualBlock(hidden_dim) for _ in range(n_blocks)])
         self.output_proj = nn.Linear(hidden_dim, n_field_vars)
-        self.output_scale = nn.Parameter(torch.ones(n_field_vars))
-        self.output_scale.data[6] = output_scale_init
+        #self.output_scale = nn.Parameter(torch.ones(n_field_vars))
+        #self.output_scale.data[6] = output_scale_init
         self._init_weights()
 
     def _init_weights(self):
@@ -646,7 +646,7 @@ class SRPINN(nn.Module):
         for block in self.blocks:
             x = block(x)
         out = self.output_proj(x)
-        out = out * self.output_scale
+        #out = out * self.output_scale
         return out
 
 
