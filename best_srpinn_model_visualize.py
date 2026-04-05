@@ -97,17 +97,31 @@ def get_true_voltage_from_dataset(dataset, id_):
 checkpoint = torch.load(model_path, map_location=device)
 
 # ====================== Загрузка модели ======================
+# ====================== Загрузка модели и статистик ======================
 model = SRPINN(
     n_spatial=3,
     n_shape_params=2,
     n_coarse_nodes=8,
     n_field_vars=8,
     hidden_dim=256,
-    n_blocks=10,
+    n_blocks=6,
 )
-# Загружаем веса (прямо state_dict, без обёртки)
-state_dict = torch.load(model_path, map_location=device)
-model.load_state_dict(state_dict)
+# Загрузка чекпоинта со статистиками
+checkpoint = torch.load('best_srpinn_model_with_stats.pth', map_location=device, weights_only=False)
+
+# Извлечение весов и статистик
+state_dict = checkpoint['model_state_dict']
+# Удаляем префикс _orig_mod. если он есть
+new_state_dict = {}
+for k, v in state_dict.items():
+    if k.startswith('_orig_mod.'):
+        new_key = k[10:]  # удаляем '_orig_mod.'
+    else:
+        new_key = k
+    new_state_dict[new_key] = v
+model.load_state_dict(new_state_dict)
+fields_mean = checkpoint['fields_mean'].numpy()
+fields_std = checkpoint['fields_std'].numpy()
 model.to(device)
 model.eval()
 

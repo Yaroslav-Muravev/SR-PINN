@@ -801,7 +801,7 @@ class StressPINNLoss(nn.Module):
                     count += 1
             if count > 0:
                 loss_voltage = loss_voltage / count
-                log.debug(f"[DEBUG] uid {uid}: V_pred={V_pred.item():.3e}, V_true={V_true.item():.3e}, loss_voltage={loss_voltage.item():.6f}")
+                logger.debug(f"[DEBUG] uid {uid}: V_pred={V_pred.item():.3e}, V_true={V_true.item():.3e}, loss_voltage={loss_voltage.item():.6f}")
 
         total_loss = loss_data + self.lambda_voltage * loss_voltage
         return total_loss, {
@@ -846,7 +846,7 @@ def prepare_datasets(data_dir: str,
         n_neighbors=n_neighbors,
         normalize=True,
         external_stats=external_stats,
-        subsample_ratio=1.0  # ускорение обучения
+        subsample_ratio=0.1  # ускорение обучения
     )
 
     val_dataset = CylinderStressDataset(
@@ -857,7 +857,7 @@ def prepare_datasets(data_dir: str,
         n_neighbors=n_neighbors,
         normalize=True,
         external_stats=external_stats,
-        subsample_ratio=1.0  # полная валидация
+        subsample_ratio=0.1  # полная валидация
     )
 
     # === 3. Загружаем coarse-данные только для train + val ===
@@ -1016,12 +1016,12 @@ def train_srpinn(model, train_loader, val_dataset, colloc_loader, component_weig
     voltage_iter = iter(voltage_loader)
 
     # Отладка: проверка voltage_loader
-    log.debug(f"[DEBUG] voltage_loader has {len(voltage_loader)} batches")
+    logger.debug(f"[DEBUG] voltage_loader has {len(voltage_loader)} batches")
     if len(voltage_loader) > 0:
         sample_batch = next(iter(voltage_loader))
         for key in sample_batch:
             shape = sample_batch[key].shape if hasattr(sample_batch[key], 'shape') else None
-            log.debug(f"[DEBUG] sample batch key '{key}': shape = {shape}")
+            logger.debug(f"[DEBUG] sample batch key '{key}': shape = {shape}")
 
     step_counter = 0
     for epoch in range(n_epochs):
@@ -1032,7 +1032,7 @@ def train_srpinn(model, train_loader, val_dataset, colloc_loader, component_weig
             # 1. Проверяем, нужно ли вычислять voltage loss
             compute_voltage = (step_counter % voltage_every == 0)
             if compute_voltage:
-                log.debug(f"[DEBUG] step {step_counter} computing voltage loss")
+                logger.debug(f"[DEBUG] step {step_counter} computing voltage loss")
 
             # 2. Основной forward
             batch = to_device(batch, device)
@@ -1052,7 +1052,7 @@ def train_srpinn(model, train_loader, val_dataset, colloc_loader, component_weig
                     if isinstance(vbatch[key], torch.Tensor) and vbatch[key].dim() > 0 and vbatch[key].size(0) == 1:
                         vbatch[key] = vbatch[key].squeeze(0)
                 _, vloss_dict = criterion(model, vbatch, None)
-                log.debug(f"[DEBUG] vloss_dict = {vloss_dict}")
+                logger.debug(f"[DEBUG] vloss_dict = {vloss_dict}")
                 loss = loss + vloss_dict['loss_voltage']
                 loss_dict['loss_voltage'] = vloss_dict['loss_voltage']
             else:
@@ -1162,7 +1162,7 @@ if __name__ == "__main__":
         n_neighbors=8,
         normalize=True,
         external_stats=(stats['fields_mean'], stats['fields_std']),
-        subsample_ratio=1.0
+        subsample_ratio=0.1
     )
 
     # Coarse для test
