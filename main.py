@@ -9,6 +9,7 @@ import os
 import glob
 import re
 import h5py
+from torch.utils.data import Subset
 from typing import Optional, Tuple, List, Dict, Iterable
 import logging
 
@@ -676,7 +677,7 @@ class VoltageDataset(Dataset):
 
 # ---------------------- Модель SR-PINN ----------------------
 class FourierFeatureEmbedding(nn.Module):
-    def __init__(self, input_dim: int, mapping_size: int = 128, scale: float = 10.0):
+    def __init__(self, input_dim: int, mapping_size: int = 256, scale: float = 10.0):
         super().__init__()
         self.B = nn.Parameter(torch.randn(input_dim, mapping_size) * scale, requires_grad=False)
 
@@ -712,8 +713,8 @@ class SRPINN(nn.Module):
                  n_shape_params: int = 2,
                  n_coarse_nodes: int = 8,
                  n_field_vars: int = 8,
-                 hidden_dim: int = 256,
-                 n_blocks: int = 6,
+                 hidden_dim: int = 128,
+                 n_blocks: int = 4,
                  fourier_mapping_size: int = 128,
                  fourier_scale: float = 5.0,
                  output_scale_init=1000.0):
@@ -753,7 +754,7 @@ class SRPINN(nn.Module):
 
 
 class StressPINNLoss(nn.Module):
-    def __init__(self, lambda_data: float = 1.0, lambda_voltage: float = 10.0, component_weights=None):
+    def __init__(self, lambda_data: float = 1.0, lambda_voltage: float = 30.0, component_weights=None):
         super().__init__()
         self.lambda_data = lambda_data
         self.lambda_voltage = lambda_voltage
@@ -803,7 +804,7 @@ class StressPINNLoss(nn.Module):
                 loss_voltage = loss_voltage / count
                 logger.debug(f"[DEBUG] uid {uid}: V_pred={V_pred.item():.3e}, V_true={V_true.item():.3e}, loss_voltage={loss_voltage.item():.6f}")
 
-        total_loss = loss_data + self.lambda_voltage * loss_voltage
+        total_loss = loss_data #+ self.lambda_voltage * loss_voltage
         return total_loss, {
             'loss_data': loss_data.item(),
             'loss_voltage': loss_voltage.item(),
@@ -846,7 +847,7 @@ def prepare_datasets(data_dir: str,
         n_neighbors=n_neighbors,
         normalize=True,
         external_stats=external_stats,
-        subsample_ratio=0.1  # ускорение обучения
+        subsample_ratio=0.3  # ускорение обучения
     )
 
     val_dataset = CylinderStressDataset(
@@ -1091,6 +1092,7 @@ def train_srpinn(model, train_loader, val_dataset, colloc_loader, component_weig
                 best_voltage_error = voltage_error
                 torch.save(model.state_dict(), 'best_srpinn_model_voltage.pth')
                 logger.info(f">>> Saved best model (voltage error {best_voltage_error:.4f}) <<<")
+            
 
 
 def parse_idx_train(data_dir: str) -> Tuple[List[int], List[int], List[int]]:
@@ -1127,6 +1129,78 @@ def parse_idx_train(data_dir: str) -> Tuple[List[int], List[int], List[int]]:
     train_ids = ids_sorted[val_split:]
 
     return train_ids, val_ids, test_ids
+
+def compute_ntk_spectrum(model, train_loader, device, n_samples=200, output_component=0):
+    """
+    Вычисляет эмпирическую матрицу Грама NTK (для одного вых. компонента)
+    на n_samples точках и возвращает её собственные значения.
+    
+    Параметры:
+        model: модель SRPINN (должна быть в eval(), но параметры требуют градиентов)
+        train_loader: DataLoader с обучающими данными
+        device: cuda/cpu
+        n_samples: количество точек для анализа (≤200)
+        output_component: индекс компоненты поля для анализа (0..6)
+    """
+    model.eval()
+    # Переводим параметры в состояние "требуют градиента"
+    for p in model.parameters():
+        p.requires_grad = True
+
+    # Собираем батч из n_samples точек
+    points = []
+    for batch in train_loader:
+        coords = batch['coords']
+        shape = batch['shape_params']
+        patch = batch['coarse_patch']
+        for i in range(coords.size(0)):
+            points.append((
+                coords[i:i+1].to(device),
+                shape[i:i+1].to(device),
+                patch[i:i+1].to(device)
+            ))
+            if len(points) >= n_samples:
+                break
+        if len(points) >= n_samples:
+            break
+    
+    n = len(points)
+    print(f"Computing NTK for {n} points, output component {output_component}...")
+
+    # Накапливаем градиенты по каждой точке отдельно
+    grads = []  # list of tensors (1D, размер параметров)
+    for i, (coord, shp, pch) in enumerate(points):
+        model.zero_grad()
+        pred = model(coord, shp, pch)  # (1, 7)
+        # Выбираем нужный компонент
+        out = pred[0, output_component]
+        # Считаем градиент по всем параметрам
+        grad = torch.autograd.grad(out, model.parameters(), retain_graph=False)
+        # Схлопываем все градиенты в один вектор (на CPU, чтобы не забивать GPU память)
+        flat_grads = torch.cat([g.detach().cpu().view(-1).float() for g in grad])
+        grads.append(flat_grads)
+        # Очищаем кэш дифференцирования (важно!)
+        model.zero_grad()
+        del grad, flat_grads  # на GPU уже нет, но подчистим
+
+    # Формируем матрицу G размера (n, num_params)
+    num_params = grads[0].numel()
+    print(f"Number of parameters: {num_params:,}")
+    G = torch.zeros(n, num_params, dtype=torch.float32)
+    for i, g in enumerate(grads):
+        G[i] = g
+
+    # Перемножаем: K = G @ G^T (n x n)
+    K = G @ G.t()  # на CPU, float32
+    K = K.numpy()
+
+    # Симметризуем на всякий случай (численные ошибки)
+    K = 0.5 * (K + K.T)
+
+    # Собственные значения
+    eigvals = np.linalg.eigvalsh(K)  # уже отсортированы по возрастанию
+    return eigvals, K
+
 
 
 # ---------------------- Запуск ----------------------
@@ -1193,17 +1267,19 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
+    model_ntk = SRPINN(n_field_vars=7).to(device)
+
     component_weights = 1.0 / (train_dataset.fields_std_np ** 2)
     component_weights = component_weights / component_weights.mean()  # нормировка
     component_weights = torch.tensor(component_weights, dtype=torch.float32).to(device)
     # Усиливаем phi (индекс 6) в 10–100 раз
-    component_weights[6] *= 1e4
+    # component_weights[6] *= 1e4
     # Ослабляем компоненту 5, если она доминирует
-    component_weights[5] *= 0.1
+    #component_weights[5] *= 0.1
 
     # Обучение
     train_srpinn(model, train_loader, val_dataset, colloc_loader, component_weights,
-                 voltage_loader, n_epochs=300, device=device, lr=5e-4, pde_every=5, voltage_every=100)
+                 voltage_loader, n_epochs=300, device=device, lr=1e-5, pde_every=5, voltage_every=100)
     # Тест
     print("\n=== ОЦЕНКА НА ТЕСТОВЫХ ID ===")
     model.load_state_dict(torch.load('best_srpinn_model_voltage.pth', map_location=device))
@@ -1211,6 +1287,24 @@ if __name__ == "__main__":
     test_errors = compute_voltage_error(model, test_dataset, device, verbose=True, return_list=True)
     print(f"Test mean log error (decades): {np.mean(test_errors):.4f}")
     print(f"Test median log error: {np.median(test_errors):.4f}")
+
+    eigvals, K_mat = compute_ntk_spectrum(model_ntk, train_loader, device, n_samples=150, output_component=6)  
+    # компонента 6 = phi_real (напряжение наиболее важно)
+
+    print("Спектр NTK (первые 10 соб. значений):", eigvals[:10])
+    print("Минимальное: ", eigvals[0])
+    print("Максимальное: ", eigvals[-1])
+    cond = eigvals[-1] / eigvals[0] if eigvals[0] > 1e-12 else np.inf
+    print(f"Число обусловленности: {cond:.2e}")
+
+    # Оценка скорости сходимости: ошибка ∝ exp(-2*λ_min * epoch_steps)
+    # Для дискретного GD: скорость ~ (1 - η*λ_min)
+    # При η=5e-4, шагов до уменьшения ошибки в e раз: ~1/(η*λ_min)
+    if eigvals[0] > 1e-12:
+        steps_for_e_fold = 1.0 / (5e-4 * eigvals[0])
+        print(f"Оценочное число итераций для уменьшения ошибки в e раз: {steps_for_e_fold:.0f}")
+    else:
+        print("λ_min близко к нулю, сходимость будет крайне медленной.")
 
     # Сохранение с статистиками
     torch.save({

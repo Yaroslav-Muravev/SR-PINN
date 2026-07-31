@@ -5,3 +5,8 @@ pytorch_cache/
 __pycache__/
 *.zip
 *.png
+*.7z
+*.zip
+*.exe
+*.npz
+*.log

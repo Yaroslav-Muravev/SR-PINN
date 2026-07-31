@@ -285,7 +285,7 @@ def visualize_ux_uy(
     uy_true = top_fields_true[:, 2]
 
     # 8b. Относительная ошибка модели (сырая, без клиппинга)
-    eps_rel = 1e-12
+    eps_rel = 1e-20
     ux_rel_err_model = np.abs(ux_pred - ux_true) / (np.abs(ux_true) + eps_rel)
     uy_rel_err_model = np.abs(uy_pred - uy_true) / (np.abs(uy_true) + eps_rel)
 
@@ -315,7 +315,7 @@ def visualize_ux_uy(
     ux_rel_err_clipped = ux_rel_err_model.copy()
     mask_ux = ux_rel_err_clipped > 0.07
     ux_rel_err_clipped[mask_ux] = 0.07 + np.random.uniform(0, 0.01, size=np.sum(mask_ux))
-    tcf3 = ax3.tripcolor(tri, ux_rel_err_clipped, shading='gouraud', cmap='hot')
+    tcf3 = ax3.tripcolor(tri, ux_rel_err_model, shading='gouraud', cmap='hot')
     ax3.set_title('Relative error')
     ax3.set_xlabel('x (m)'); ax3.set_ylabel('y (m)')
     ax3.axis('equal')
@@ -339,7 +339,8 @@ def visualize_ux_uy(
     uy_rel_err_clipped = uy_rel_err_model.copy()
     mask_uy = uy_rel_err_clipped > 0.07
     uy_rel_err_clipped[mask_uy] = 0.07 + np.random.uniform(0, 0.01, size=np.sum(mask_uy))
-    tcf6 = ax6.tripcolor(tri, uy_rel_err_clipped, shading='gouraud', cmap='hot')
+    tcf6 = ax6.tripcolor(tri, uy_rel_err_model, shading='gouraud', cmap='hot')
+    print(uy_rel_err_model[uy_rel_err_clipped > 0.07])
     ax6.set_title('Relative error')
     ax6.set_xlabel('x (m)'); ax6.set_ylabel('y (m)')
     ax6.axis('equal')
