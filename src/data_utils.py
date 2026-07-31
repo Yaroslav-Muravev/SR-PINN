@@ -342,3 +342,18 @@ def compute_patch_for_points(
             patch_rel.reshape(N, -1)
         ], axis=1)
     return patch
+
+def load_coarse_voltage_data(data_dir="./files/"):
+    """Загружает все results_coarse*.csv, возвращает DataFrame с r_um, h_um, |V|."""
+    csv_files = glob.glob(data_dir + "results_coarse*.csv")
+    if not csv_files:
+        raise FileNotFoundError("Не найдены results_coarse*.csv в папке ./files/")
+    df_list = []
+    for f in csv_files:
+        df = pd.read_csv(f)
+        df['voltage_complex'] = df['voltage'].apply(parse_complex)
+        df['V_abs'] = df['voltage_complex'].apply(abs)
+        df_list.append(df)
+    df_all = pd.concat(df_list, ignore_index=True)
+    df_all = df_all.dropna(subset=['r_um', 'h_um', 'V_abs'])
+    return df_all[['id', 'r_um', 'h_um', 'V_abs']]

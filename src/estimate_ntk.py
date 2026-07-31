@@ -8,13 +8,10 @@ import torch
 import numpy as np
 from torch.utils.data import DataLoader
 
-from main import (
-    SRPINN,
-    CylinderStressDataset,
-    prepare_datasets,
-    parse_idx_train,
-    path_to_files
-)
+from src.datasets import parse_idx_train
+from src.model import SRPINN
+from src.data_utils import prepare_datasets
+from src.config import PATH_TO_FILES
 
 def compute_ntk_spectrum(model, train_loader, device, n_samples=200, output_component=1):
     model.eval()
@@ -65,12 +62,11 @@ def compute_ntk_spectrum(model, train_loader, device, n_samples=200, output_comp
     return eigvals, K
 
 def main():
-    data_dir = path_to_files
+    data_dir = PATH_TO_FILES
     train_ids, val_ids, test_ids = parse_idx_train(data_dir)
 
     MAX_TRAIN_IDS = 30
     train_ids = train_ids[:MAX_TRAIN_IDS]
-    # Передаём один существующий ID как валидационный, чтобы избежать ошибки
     val_ids = train_ids[:1]          # <-- вот исправление
     print(f"Используется {len(train_ids)} train IDs для оценки NTK.")
 
