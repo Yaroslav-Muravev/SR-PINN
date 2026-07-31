@@ -307,3 +307,38 @@ def prepare_datasets(data_dir: str,
     }
 
     return train_dataset, val_dataset, colloc_dataset, stats
+
+def compute_patch_for_points(
+    points: np.ndarray,
+    coarse_tree: cKDTree,
+    coarse_coords: np.ndarray,
+    coarse_fields: np.ndarray,
+    n_neighbors: int = 8,
+    fields_mean: Optional[np.ndarray] = None,
+    fields_std: Optional[np.ndarray] = None,
+    normalize: bool = True
+) -> np.ndarray:
+    """
+    Вычисляет патчи для заданных точек на основе coarse-данных.
+    Возвращает массив shape (N, n_neighbors * (n_field_vars + 3)).
+    """
+    N = points.shape[0]
+    n_field_vars = coarse_fields.shape[1]
+    dists, idxs = coarse_tree.query(points, k=n_neighbors)
+    neighbour_coords = coarse_coords[idxs]
+    neighbour_fields = coarse_fields[idxs]
+    scale = np.mean(dists, axis=1, keepdims=True) + 1e-8
+    rel_coords = (neighbour_coords - points[:, np.newaxis, :]) / scale[..., np.newaxis]
+    fields_flat = neighbour_fields.reshape(N, -1)
+    rel_flat = rel_coords.reshape(N, -1)
+    patch = np.concatenate([fields_flat, rel_flat], axis=1)
+    if normalize and fields_mean is not None and fields_std is not None:
+        n_fields_flat = n_neighbors * n_field_vars
+        patch_fields = patch[:, :n_fields_flat].reshape(N, n_neighbors, n_field_vars)
+        patch_rel = patch[:, n_fields_flat:].reshape(N, n_neighbors, 3)
+        patch_fields_norm = (patch_fields - fields_mean) / (fields_std + 1e-20)
+        patch = np.concatenate([
+            patch_fields_norm.reshape(N, -1),
+            patch_rel.reshape(N, -1)
+        ], axis=1)
+    return patch
