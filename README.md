@@ -75,7 +75,7 @@ This project is part of an ongoing research effort. If you want to contribute or
 
 ## 📄 License
 
-[MIT](LICENSE) (or your preferred license).
+[MIT](LICENSE)
 
 ## 📧 Contact
 
