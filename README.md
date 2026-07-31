@@ -78,4 +78,4 @@ This project is part of an ongoing research effort. If you want to contribute or
 ## 📧 Contact
 
 For questions, reach out to the author yaroslav.muravev.work@yandex.ru
----
+
