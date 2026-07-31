@@ -9,7 +9,6 @@ from typing import Iterable, Tuple, List, Optional, Dict
 import torch
 import logging
 
-from datasets import CylinderStressDataset, CollocationDataset
 from config import CACHE_DIR
 
 _MAT_CACHE = {}
@@ -194,6 +193,8 @@ def prepare_datasets(data_dir: str,
     - Статистика mean/std для полей считается ТОЛЬКО по fine-данным (target)
     - Coarse-данные используются только для patch (не для статистики)
     """
+    
+    from datasets import CylinderStressDataset, CollocationDataset
 
     fine_df = load_all_csv_cached(data_dir, 'results_fine', 'fine_df')
     coarse_df = load_all_csv_cached(data_dir, 'results_coarse', 'coarse_df')

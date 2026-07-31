@@ -1,6 +1,3 @@
-# main1.py
-# Главный скрипт для запуска обучения и тестирования SR-PINN
-
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
@@ -11,7 +8,7 @@ from data_utils import load_mat_with_cache, load_all_csv, parse_complex, prepare
 from datasets import parse_idx_train, CylinderStressDataset, VoltageDataset
 from model import SRPINN, train_srpinn, compute_voltage_error
 
-
+torch.set_float32_matmul_precision('high')
 
 def main():
     logger = setup_logging()
@@ -65,7 +62,7 @@ def main():
     colloc_loader = DataLoader(colloc_dataset, batch_size=64, shuffle=True)
 
     model = SRPINN(n_field_vars=7)
-    model = torch.compile(model)
+    #model = torch.compile(model)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
