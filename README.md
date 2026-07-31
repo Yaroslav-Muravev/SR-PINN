@@ -1,6 +1,8 @@
 # SR-PINN for Piezoelectric Resonator Shape Optimization
 
-This repository contains the code and models developed for accelerating shape optimization of piezoelectric resonators using a **Super-Resolution Physics-Informed Neural Network (SR-PINN)**. The work focuses on cylindrical (and partly spherical) piezoelectric particles for acoustic energy harvesting and neuromodulation applications.
+This repository contains the code and models developed for accelerating shape optimization of piezoelectric resonators using a **Super-Resolution Physics-Informed Neural Network (SR-PINN)**. 
+
+The work focuses on cylindrical (and partly spherical) piezoelectric particles for acoustic energy harvesting and neuromodulation applications.
 
 ## 📌 Overview
 
